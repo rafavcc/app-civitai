@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Civitai-style gallery for images and videos. No dependencies.
+"""Civit-RV: local Civitai-style gallery for images and videos. No dependencies.
 
 Usage: python3 server.py /path/to/media   (listens on 0.0.0.0:8765)
 """
@@ -88,6 +88,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_file(STATIC_DIR / "index.html")
             if url.path == "/api/items":
                 return self.api_items(q)
+            if url.path.startswith("/static/"):
+                f = (STATIC_DIR / url.path[8:]).resolve()
+                if STATIC_DIR.resolve() not in f.parents:
+                    return self.send_json({"error": "forbidden"}, 403)
+                return self.send_file(f, cache=True)
+            if url.path == "/favicon.ico":
+                return self.send_file(STATIC_DIR / "favicon-32x32.png", cache=True)
             if url.path == "/api/info":
                 return self.send_json({"folder": str(ROOT)})
             if url.path == "/api/folder":

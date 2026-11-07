@@ -1,4 +1,4 @@
-# Session summary: Local Gallery (Civitai-style local media browser)
+# Session summary: Civit-RV (Civitai-style local media browser)
 
 ## Goal
 A local app that shows my own images/videos as small tiles like civitai.com, loading more as I scroll.

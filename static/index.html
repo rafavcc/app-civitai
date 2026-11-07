@@ -6,27 +6,30 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
-<link rel="icon" type="image/png" href="/static/favicon-32x32.png">
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
 <title>Civit-RV</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   body { margin: 0; background: #1a1b1e; color: #c1c2c5; font-family: system-ui, -apple-system, sans-serif; -webkit-font-smoothing: antialiased; -webkit-text-size-adjust: 100%; -webkit-touch-callout: none; }
-  header input, header select, header button { background: #25262b; color: inherit; border: 1px solid #373a40;
-            border-radius: 8px; padding: 12px 16px; font-size: 15px; min-height: 44px; }
+
 
   @media (prefers-reduced-motion: reduce) {
     * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
   }
-  header { position: sticky; top: 0; z-index: 10; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
-           padding: 10px 16px; background: #141517; border-bottom: 1px solid #2c2e33; }
-  header input, header select, header button { background: #25262b; color: inherit; border: 1px solid #373a40;
+  header { position: sticky; top: 0; z-index: 10; display: flex; flex-direction: column; gap: 6px;
+           padding: 8px 16px; background: #141517; border-bottom: 1px solid #2c2e33; }
+  .header-row { display: flex; gap: 8px; align-items: center; }
+  header input[type=search], header select, header button { background: #25262b; color: inherit; border: 1px solid #373a40;
            border-radius: 6px; padding: 6px 10px; font-size: 14px; }
-  header input { flex: 1; min-width: 160px; }
+  header input[type=search] { flex: 1; min-width: 0; }
+  header input[type=checkbox] { width: 16px; height: 16px; margin: 0; accent-color: #4dabf7; }
+  header input[type=range] { width: 90px; margin: 0; accent-color: #4dabf7; }
   .chk { font-size: 13px; display: flex; align-items: center; gap: 4px; white-space: nowrap; }
-  #count { margin-left: auto; font-size: 13px; opacity: .7; }
+  #count { margin-left: auto; font-size: 13px; opacity: .7; white-space: nowrap; }
   :root { --gap: 8px; --pad: 16px; --cols: 4; }
-  @media (max-width: 700px) { :root { --gap: 2px; --pad: 2px; } header { padding: 8px; } }
+  @media (max-width: 700px) { :root { --gap: 2px; --pad: 2px; } header { padding: 6px 8px; } header select, header button { padding: 6px 8px; } }
   #wrap { container-type: inline-size; }
   #grid { display: grid; gap: var(--gap); padding: 12px var(--pad); grid-template-columns: repeat(var(--cols), 1fr);
           grid-auto-flow: row dense;
@@ -69,7 +72,7 @@
   <div class="header-row">
     <label class="chk"><input type="checkbox" id="rand"> Random</label>
     <label id="autolbl" class="chk"><input type="checkbox" id="auto"> Auto-scroll</label>
-    <input type="range" id="speed" min="0" max="100" value="50" title="Auto-scroll speed" style="width:90px">
+    <input type="range" id="speed" min="0" max="100" value="50" title="Auto-scroll speed">
     <span id="count"></span>
   </div>
 </header>
@@ -168,7 +171,7 @@ new IntersectionObserver(es => { if (es[0].isIntersecting) loadMore(); }, { root
 let t;
 $('q').oninput = () => { clearTimeout(t); t = setTimeout(reset, 250); };
 $('kind').onchange = $('sort').onchange = $('rand').onchange = reset;
-fetch('/api/info').then(r => r.json()).then(r => { document.title = 'Local Gallery - ' + r.folder.split('/').pop(); });
+fetch('/api/info').then(r => r.json()).then(r => { document.title = 'Civit-RV - ' + r.folder.split('/').pop(); });
 $('rescan').onclick = async () => { await fetch('/api/rescan'); reset(); };
 
 let cur = -1;
@@ -235,7 +238,7 @@ $('folder').onclick = () => pickFolder('Open folder', async name => {
   const res = await (await fetch('/api/folder?name=' + encodeURIComponent(name))).json();
   if (res.error) return toast(res.error);
   closeMv();
-  document.title = 'Local Gallery - ' + name;
+  document.title = 'Civit-RV - ' + name;
   reset();
 });
 
