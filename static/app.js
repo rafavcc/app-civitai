@@ -87,7 +87,15 @@ new IntersectionObserver(es => { if (es[0].isIntersecting) loadMore(); }, { root
 let t;
 $('q').oninput = () => { clearTimeout(t); t = setTimeout(reset, 250); };
 $('kind').onchange = $('sort').onchange = $('rand').onchange = reset;
-fetch('/api/info').then(r => r.json()).then(r => { document.title = 'Civit-RV - ' + r.folder.split('/').pop(); });
+// Shows the current location in the title and on the folder button
+function setLocation(path, base) {
+  const name = path || base;
+  document.title = 'Civit-RV - ' + name;
+  $('folder').textContent = '📁 ' + name;
+  $('folder').title = 'Change folder (' + name + ')';
+}
+let baseName = '';
+fetch('/api/info').then(r => r.json()).then(r => { baseName = r.base; setLocation(r.path, r.base); });
 $('rescan').onclick = async () => { await fetch('/api/rescan'); reset(); };
 
 let cur = -1;
@@ -133,28 +141,51 @@ function toast(msg) {
   toastTimer = setTimeout(() => t.style.display = 'none', 3000);
 }
 
-// Shared folder-grid overlay used by both Move and the Folder button
-async function pickFolder(title, onPick) {
-  let r;
-  try { r = await (await fetch('/api/folders')).json(); } catch (e) { return toast('Could not load folders'); }
-  $('mvtitle').textContent = title;
-  const grid = $('mvgrid');
-  grid.innerHTML = '';
-  for (const name of r.folders) {
-    const b = document.createElement('button');
-    b.className = 'fbtn' + (name === r.current ? ' cur' : '') + (RED.has(name.toLowerCase()) ? ' red' : '');
-    b.textContent = name === r.current ? name + ' (current)' : name;
-    b.onclick = () => onPick(name);
-    grid.appendChild(b);
+// Folder navigator overlay shared by "open folder" and "move to folder".
+// Tapping a folder that has subfolders goes into it; a folder without subfolders is chosen directly.
+// The "here" button chooses the folder being shown (including the top-level folder).
+async function pickFolder(title, hereLabel, startPath, onPick) {
+  async function show(path) {
+    let r;
+    try { r = await (await fetch('/api/folders' + (path === null ? '' : '?path=' + encodeURIComponent(path)))).json(); }
+    catch (e) { return toast('Could not load folders'); }
+    if (r.error) return toast(r.error);
+    $('mvtitle').textContent = title;
+    const crumbs = $('mvcrumbs');
+    crumbs.innerHTML = '';
+    r.crumbs.forEach((c, i) => {
+      if (i) crumbs.append('›');
+      const b = document.createElement('button');
+      b.textContent = c.name;
+      b.onclick = () => show(c.path);
+      crumbs.append(b);
+    });
+    $('mvhere').textContent = `${hereLabel}: ${r.crumbs[r.crumbs.length - 1].name}`;
+    $('mvhere').onclick = () => onPick(r.path);
+    const grid = $('mvgrid');
+    grid.innerHTML = '';
+    for (const f of r.folders) {
+      const b = document.createElement('button');
+      b.className = 'fbtn' + (f.path === r.current ? ' cur' : '') + (RED.has(f.name.toLowerCase()) ? ' red' : '');
+      b.append((f.subdirs ? '📂 ' : '') + f.name);
+      const cnt = document.createElement('span');
+      cnt.className = 'cnt';
+      cnt.textContent = f.subdirs ? `${f.subdirs} folders · ${f.files} files` : `${f.files} files`;
+      b.append(cnt);
+      b.onclick = () => f.subdirs ? show(f.path) : onPick(f.path);
+      grid.appendChild(b);
+    }
+    $('mv').scrollTo(0, 0);
+    $('mv').classList.add('open');
   }
-  $('mv').classList.add('open');
+  show(startPath);
 }
 
-$('folder').onclick = () => pickFolder('Open folder', async name => {
-  const res = await (await fetch('/api/folder?name=' + encodeURIComponent(name))).json();
+$('folder').onclick = () => pickFolder('Open folder', 'Open', null, async path => {
+  const res = await (await fetch('/api/folder?path=' + encodeURIComponent(path))).json();
   if (res.error) return toast(res.error);
   closeMv();
-  document.title = 'Civit-RV - ' + name;
+  setLocation(res.path, baseName);
   reset();
 });
 
@@ -172,8 +203,8 @@ $('mvclose').onclick = closeMv;
 $('mvbtn').onclick = () => {
   const it = listed[cur];
   if (!it) return;
-  pickFolder('Move to folder', async name => {
-    const res = await (await fetch('/api/move?' + new URLSearchParams({ id: it.id, dest: name }), { method: 'POST' })).json();
+  pickFolder('Move to folder', 'Move here', '', async dest => {
+    const res = await (await fetch('/api/move?' + new URLSearchParams({ id: it.id, dest }), { method: 'POST' })).json();
     if (res.error) return toast(res.error);
     closeMv();
     closeLb();

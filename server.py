@@ -32,7 +32,8 @@ PORT = 8765
 THUMB_WIDTH = 512
 CACHED_STATIC_EXT = {".png", ".svg", ".ico"}  # css/js stay uncached so edits show up right away
 
-ROOT: Path = Path(".")
+BASE: Path = Path(".")  # fixed top-level folder; nothing outside it is ever served or touched
+ROOT: Path = Path(".")  # folder currently shown (BASE or a subfolder); only its own files are listed
 ITEMS: list[dict] = []
 LOCK = threading.Lock()
 SCAN_VERSION = 0
@@ -98,25 +99,42 @@ def make_thumb(item):
             tmp.unlink(missing_ok=True)
 
 
+def kind_of(name):
+    ext = os.path.splitext(name)[1].lower()
+    return "image" if ext in IMAGE_EXT else "video" if ext in VIDEO_EXT else None
+
+
+def resolve_rel(rel):
+    """Resolves a '/'-separated path relative to BASE. Returns None if it is hidden, outside BASE or not a folder."""
+    parts = [p for p in rel.split("/") if p]
+    if any(p.startswith(".") for p in parts):  # also rejects ".."
+        return None
+    p = (BASE / "/".join(parts)).resolve()
+    if p != BASE and BASE not in p.parents:
+        return None
+    return p if p.is_dir() else None
+
+
+def rel_of(p):
+    return "" if p == BASE else p.relative_to(BASE).as_posix()
+
+
 def scan():
     items = []
-    for dirpath, dirnames, filenames in os.walk(ROOT):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-        for name in filenames:
-            if name.startswith("."):
+    with os.scandir(ROOT) as it:
+        for e in it:
+            if e.name.startswith(".") or not e.is_file():
                 continue
-            ext = os.path.splitext(name)[1].lower()
-            kind = "image" if ext in IMAGE_EXT else "video" if ext in VIDEO_EXT else None
+            kind = kind_of(e.name)
             if not kind:
                 continue
-            full = os.path.join(dirpath, name)
             try:
-                st = os.stat(full)
+                st = e.stat()
             except OSError:
                 continue
             items.append({
-                "path": os.path.relpath(full, ROOT),
-                "name": name,
+                "path": e.name,
+                "name": e.name,
                 "kind": kind,
                 "mtime": st.st_mtime,
                 "size": st.st_size,
@@ -148,7 +166,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlparse(self.path)
-        q = parse_qs(url.query)
+        q = parse_qs(url.query, keep_blank_values=True)  # an empty path means the top-level folder
         try:
             if url.path == "/":
                 return self.send_file(STATIC_DIR / "index.html")
@@ -162,11 +180,11 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/favicon.ico":
                 return self.send_file(STATIC_DIR / "favicon-32x32.png", cache=True)
             if url.path == "/api/info":
-                return self.send_json({"folder": str(ROOT)})
+                return self.send_json({"folder": str(ROOT), "path": rel_of(ROOT), "base": BASE.name})
             if url.path == "/api/folder":
-                return self.switch_folder(q.get("name", [""])[0])
+                return self.switch_folder(q.get("path", [""])[0])
             if url.path == "/api/folders":
-                return self.list_folders()
+                return self.list_folders(q.get("path", [None])[0])
             if url.path == "/api/rescan":
                 return self.send_json({"count": scan()})
             if url.path.startswith("/media/"):
@@ -184,7 +202,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         url = urlparse(self.path)
-        q = parse_qs(url.query)
+        q = parse_qs(url.query, keep_blank_values=True)  # an empty path means the top-level folder
         try:
             if url.path == "/api/move":
                 return self.move_item(int(q["id"][0]), q["dest"][0])
@@ -199,17 +217,42 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "bad request"}, 400)
         self.send_json({"error": "not found"}, 404)
 
-    def list_folders(self):
-        # Sibling folders of the current folder (same root, different leaf)
-        parent = ROOT.parent
-        names = sorted((p.name for p in parent.iterdir() if p.is_dir() and not p.name.startswith(".")),
-                       key=str.lower)
-        self.send_json({"root": str(parent), "current": ROOT.name, "folders": names})
+    def list_folders(self, rel):
+        """Subfolders of `rel` (default: the current folder's parent) with breadcrumbs, for the folder navigator."""
+        if rel is None:
+            rel = rel_of(ROOT.parent) if ROOT != BASE else ""
+        d = resolve_rel(rel)
+        if d is None:
+            return self.send_json({"error": "Invalid folder"}, 400)
+        base_rel = rel_of(d)
+        folders = []
+        with os.scandir(d) as it:
+            entries = sorted((e for e in it if not e.name.startswith(".") and e.is_dir()),
+                             key=lambda e: e.name.lower())
+        for e in entries:
+            subdirs = files = 0
+            try:
+                with os.scandir(e.path) as sub:
+                    for c in sub:
+                        if c.name.startswith("."):
+                            continue
+                        if c.is_dir():
+                            subdirs += 1
+                        elif kind_of(c.name):
+                            files += 1
+            except OSError:
+                pass
+            folders.append({"name": e.name, "path": f"{base_rel}/{e.name}".lstrip("/"),
+                            "subdirs": subdirs, "files": files})
+        crumbs, acc = [{"name": BASE.name, "path": ""}], ""
+        for part in base_rel.split("/") if base_rel else []:
+            acc = f"{acc}/{part}".lstrip("/")
+            crumbs.append({"name": part, "path": acc})
+        self.send_json({"path": base_rel, "crumbs": crumbs, "folders": folders, "current": rel_of(ROOT)})
 
     def move_item(self, idx, dest):
-        parent = ROOT.parent
-        dest_dir = (parent / dest).resolve()
-        if dest_dir.parent != parent.resolve() or dest.startswith(".") or not dest_dir.is_dir():
+        dest_dir = resolve_rel(dest)
+        if dest_dir is None:
             return self.send_json({"error": "Invalid destination folder"}, 400)
         with LOCK:
             item = ITEMS[idx] if 0 <= idx < len(ITEMS) else None
@@ -229,18 +272,12 @@ class Handler(BaseHTTPRequestHandler):
                 n += 1
             shutil.move(str(src), str(target))
             log.info("Moved %s -> %s", src, target)
-            if dest_dir == ROOT:
-                item["path"] = os.path.relpath(target, ROOT)
-                item["name"] = target.name
-                moved = False
-            else:
-                item["moved"] = True
-                moved = True
-        self.send_json({"ok": True, "moved": moved, "to": str(target)})
+            item["moved"] = True
+        self.send_json({"ok": True, "moved": True, "to": str(target)})
 
     def delete_item(self, idx):
-        # Deleted files go to a hidden .trash folder next to the leaf folders, so they stay recoverable
-        trash = ROOT.parent / ".trash"
+        # Deleted files go to a hidden .trash folder at the top-level folder, so they stay recoverable
+        trash = BASE / ".trash"
         with LOCK:
             item = ITEMS[idx] if 0 <= idx < len(ITEMS) else None
             if item is None:
@@ -266,12 +303,11 @@ class Handler(BaseHTTPRequestHandler):
         ROOT = Path(path)
         save_state(folder=str(ROOT))
         log.info("Folder changed to %s", ROOT)
-        self.send_json({"folder": str(ROOT), "count": scan()})
+        self.send_json({"folder": str(ROOT), "path": rel_of(ROOT), "count": scan()})
 
-    def switch_folder(self, name):
-        parent = ROOT.parent
-        new = (parent / name).resolve()
-        if name.startswith(".") or new.parent != parent.resolve() or not new.is_dir():
+    def switch_folder(self, rel):
+        new = resolve_rel(rel)
+        if new is None:
             return self.send_json({"error": "Invalid folder"}, 400)
         self.set_folder(new)
 
@@ -392,23 +428,20 @@ class Server(ThreadingHTTPServer):
 
 
 def main():
-    global ROOT
+    global BASE, ROOT
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser()
-    ap.add_argument("folder", nargs="?", help="folder with your images/videos; used only when no folder was saved "
-                    "from a previous run (see --reset)")
-    ap.add_argument("--reset", action="store_true", help="ignore the saved folder and use FOLDER")
+    ap.add_argument("folder", help="top-level folder; you can open it and any subfolder, nothing outside it")
     args = ap.parse_args()
-    saved = None if args.reset else load_state().get("folder")
-    if saved and Path(saved).is_dir():
-        ROOT = Path(saved).resolve()
-        log.info("Using saved folder %s", ROOT)
-    elif args.folder:
-        ROOT = Path(args.folder).expanduser().resolve()
-    else:
-        raise SystemExit("No folder given and none saved. Usage: server.py /path/to/media")
-    if not ROOT.is_dir():
-        raise SystemExit(f"Not a folder: {ROOT}")
+    BASE = ROOT = Path(args.folder).expanduser().resolve()
+    if not BASE.is_dir():
+        raise SystemExit(f"Not a folder: {BASE}")
+    saved = load_state().get("folder")
+    if saved:
+        saved = Path(saved).resolve()
+        if saved.is_dir() and (saved == BASE or BASE in saved.parents):
+            ROOT = saved
+            log.info("Resuming in %s", ROOT)
     save_state(folder=str(ROOT))
     if not FFMPEG:
         log.warning("ffmpeg not found: tiles will load full-size originals and videos will have no posters")

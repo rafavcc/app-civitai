@@ -41,7 +41,13 @@
   #mv.open { display: flex; }
   #toast { position: fixed; bottom: calc(24px + var(--sab)); left: 50%; transform: translateX(-50%); background: #c92a2a; color: #fff; padding: 8px 14px; border-radius: 8px; font-size: 14px; z-index: 40; display: none; }
   #mvhead { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-  #mvgrid { display: grid; gap: 8px; grid-template-columns: repeat(5, 1fr); }
+  #mvgrid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); }
+  #mvcrumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; margin-bottom: 10px; font-size: 15px; }
+  #mvcrumbs button { background: none; border: 0; color: #4dabf7; font-size: 15px; padding: 8px 4px; cursor: pointer; }
+  #mvcrumbs button:last-child { color: inherit; font-weight: 600; }
+  .fbtn.here { margin-bottom: 12px; padding: 12px 4px; border-color: #4dabf7; }
+  .fbtn .cnt { display: block; margin-top: 4px; font-size: 11px; opacity: .6; }
+  #folder { max-width: 42vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .fbtn { background: #25262b; color: inherit; border: 1px solid #373a40; border-radius: 8px; padding: 18px 4px; font-size: 14px; cursor: pointer; word-break: break-word; }
   .fbtn:hover { outline: 2px solid #4dabf7; }
   .fbtn.cur { opacity: .5; }
