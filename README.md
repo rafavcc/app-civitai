@@ -1,28 +1,29 @@
 # Civit-RV
 
-Civitai-style tile gallery for local images and videos. Optimized for iPhone 15 Pro with iOS meta tags, touch-friendly UI, CLS prevention, and dark theme. Features infinite scroll, hover-to-play videos, keyboard lightbox (arrow keys / Esc), search, sort and filter. Pure vanilla JS/CSS frontend served by Python HTTP server.
-
-## Installation
-No external dependencies required.
+Civitai-style tile gallery for local images and videos, tuned for iPhone (Safari). Python 3 standard library only (ffmpeg is optional, for thumbnails); the UI is plain HTML/CSS/JS.
 
 ```
-python3 server.py /path/to/your/media
+python3 server.py /path/to/your/media [--reset]
 ```
 
-## Usage
-
-```bash
-python3 server.py /path/to/your/media
-```
-
-The server runs on the host that holds the media (WSL, 192.168.0.33) and listens on `0.0.0.0:8765`, so open http://192.168.0.33:8765 from any LAN machine. The port (8765) and host are fixed constants at the top of `server.py`. Use "Rescan" after adding files.
+The server listens on `0.0.0.0:8765` (constants at the top of `server.py`) and prints its LAN address, e.g. http://192.168.0.33:8765. Use Safari on iPhone: Chrome/Brave can't play HEVC video.
 
 ## Features
-- **Infinite scroll** with automatic pagination
-- **Hover-to-play videos** for quick preview
-- **Keyboard lightbox** navigation (arrow keys / Esc)
-- **Search** across filenames and metadata
-- **Sort and filter** by type, size, date
-- **Dark theme** with iOS-optimized UI
-- **No external dependencies** - pure vanilla JS/CSS
-- **Mobile optimized** for iPhone 15 Pro with touch-friendly controls
+- Infinite scroll grid (4 columns, 2px gaps on mobile); landscape media spans 2 columns
+- Thumbnails and video posters generated with ffmpeg and cached in `.cache/` (falls back to originals without ffmpeg)
+- Videos autoplay muted while on screen and load their source only near the viewport
+- Lightbox with arrow keys / Esc, Back, Delete (to `../.trash`) and Move
+- Search, kind filter, sort, random order, auto-scroll; your choices are remembered per device
+- Folder picker (sibling folders); the last folder is remembered across restarts
+- Dark theme, iOS meta tags, safe-area padding for the notch / Dynamic Island
+
+## Remembered folder
+The last folder is saved in `state.json`. `FOLDER` on the command line is only used when nothing is saved; pass `--reset` to force it.
+
+## Tests
+```
+python3 -m unittest discover -s tests
+```
+
+## Files
+`server.py` (server), `static/index.html`, `static/style.css`, `static/app.js` (UI), `tests/test_server.py`.

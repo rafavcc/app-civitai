@@ -4,6 +4,7 @@
 Usage: python3 server.py /path/to/media   (listens on 0.0.0.0:8765)
 """
 import argparse
+import hashlib
 import json
 import logging
 import mimetypes
@@ -12,6 +13,7 @@ import random
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -21,15 +23,79 @@ from urllib.parse import parse_qs, urlparse
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp"}
 VIDEO_EXT = {".mp4", ".webm", ".mov", ".m4v", ".mkv"}
-STATIC_DIR = Path(__file__).parent / "static"
+APP_DIR = Path(__file__).parent
+STATIC_DIR = APP_DIR / "static"
+STATE_FILE = APP_DIR / "state.json"
+CACHE_DIR = APP_DIR / ".cache" / "thumbs"
 HOST = "0.0.0.0"
 PORT = 8765
+THUMB_WIDTH = 512
+CACHED_STATIC_EXT = {".png", ".svg", ".ico"}  # css/js stay uncached so edits show up right away
 
 ROOT: Path = Path(".")
 ITEMS: list[dict] = []
 LOCK = threading.Lock()
 SCAN_VERSION = 0
+FFMPEG = shutil.which("ffmpeg")
+THUMB_SLOTS = threading.Semaphore(4)  # bound concurrent ffmpeg processes
 log = logging.getLogger("gallery")
+
+
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(**updates):
+    state = load_state()
+    state.update(updates)
+    try:
+        STATE_FILE.write_text(json.dumps(state, indent=2))
+    except OSError:
+        log.warning("Could not write %s", STATE_FILE)
+
+
+def get_item(idx):
+    # Negative indexes would silently wrap around to the end of the list
+    with LOCK:
+        return ITEMS[idx] if 0 <= idx < len(ITEMS) else None
+
+
+def thumb_path(item):
+    key = hashlib.sha1(f"{ROOT}|{item['path']}|{item['mtime']}|{item['size']}".encode()).hexdigest()
+    return CACHE_DIR / key[:2] / f"{key}.jpg"
+
+
+def make_thumb(item):
+    """Returns the cached thumbnail path (creating it with ffmpeg if needed), or None on failure."""
+    if not FFMPEG:
+        return None
+    out = thumb_path(item)
+    if out.is_file():
+        return out
+    src = ROOT / item["path"]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(f"{out.name}.{threading.get_ident()}.tmp.jpg")
+    cmd = [FFMPEG, "-v", "error", "-y"]
+    if item["kind"] == "video":
+        cmd += ["-ss", "0.1"]
+    cmd += ["-i", str(src), "-frames:v", "1",
+            "-vf", f"scale='min({THUMB_WIDTH},iw)':-2", "-q:v", "5", str(tmp)]
+    with THUMB_SLOTS:
+        if out.is_file():  # another request finished it while we waited
+            return out
+        try:
+            subprocess.run(cmd, check=True, timeout=60, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            os.replace(tmp, out)
+            return out
+        except (subprocess.SubprocessError, OSError) as e:
+            log.warning("Thumbnail failed for %s: %s", item["path"], getattr(e, "stderr", e))
+            return None
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def scan():
@@ -92,7 +158,7 @@ class Handler(BaseHTTPRequestHandler):
                 f = (STATIC_DIR / url.path[8:]).resolve()
                 if STATIC_DIR.resolve() not in f.parents:
                     return self.send_json({"error": "forbidden"}, 403)
-                return self.send_file(f, cache=True)
+                return self.send_file(f, cache=f.suffix in CACHED_STATIC_EXT)
             if url.path == "/favicon.ico":
                 return self.send_file(STATIC_DIR / "favicon-32x32.png", cache=True)
             if url.path == "/api/info":
@@ -105,8 +171,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"count": scan()})
             if url.path.startswith("/media/"):
                 return self.media(int(url.path[7:]))
+            if url.path.startswith("/thumb/"):
+                return self.thumb(int(url.path[7:]))
         except (BrokenPipeError, ConnectionResetError):
             return
+        except ValueError:  # non-numeric ids and similar malformed input
+            return self.send_json({"error": "bad request"}, 400)
         except Exception:
             log.exception("Request failed: %s %s", self.command, self.path)
             return self.send_json({"error": "bad request"}, 400)
@@ -122,6 +192,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.delete_item(int(q["id"][0]))
         except (BrokenPipeError, ConnectionResetError):
             return
+        except ValueError:  # non-numeric ids and similar malformed input
+            return self.send_json({"error": "bad request"}, 400)
         except Exception:
             log.exception("Request failed: %s %s", self.command, self.path)
             return self.send_json({"error": "bad request"}, 400)
@@ -140,7 +212,9 @@ class Handler(BaseHTTPRequestHandler):
         if dest_dir.parent != parent.resolve() or dest.startswith(".") or not dest_dir.is_dir():
             return self.send_json({"error": "Invalid destination folder"}, 400)
         with LOCK:
-            item = ITEMS[idx]
+            item = ITEMS[idx] if 0 <= idx < len(ITEMS) else None
+            if item is None:
+                return self.send_json({"error": "File not found"}, 404)
             if item.get("moved"):
                 return self.send_json({"error": "Already moved"}, 409)
             src = (ROOT / item["path"]).resolve()
@@ -168,7 +242,9 @@ class Handler(BaseHTTPRequestHandler):
         # Deleted files go to a hidden .trash folder next to the leaf folders, so they stay recoverable
         trash = ROOT.parent / ".trash"
         with LOCK:
-            item = ITEMS[idx]
+            item = ITEMS[idx] if 0 <= idx < len(ITEMS) else None
+            if item is None:
+                return self.send_json({"error": "File not found"}, 404)
             if item.get("moved"):
                 return self.send_json({"error": "Already moved"}, 409)
             src = (ROOT / item["path"]).resolve()
@@ -188,6 +264,7 @@ class Handler(BaseHTTPRequestHandler):
     def set_folder(self, path):
         global ROOT
         ROOT = Path(path)
+        save_state(folder=str(ROOT))
         log.info("Folder changed to %s", ROOT)
         self.send_json({"folder": str(ROOT), "count": scan()})
 
@@ -227,14 +304,27 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def media(self, idx):
-        with LOCK:
-            item = ITEMS[idx]
-        if item.get("moved"):
-            return self.send_json({"error": "moved"}, 404)
+        item = get_item(idx)
+        if item is None or item.get("moved"):
+            return self.send_json({"error": "not found"}, 404)
         full = (ROOT / item["path"]).resolve()
         if ROOT not in full.parents:
             return self.send_json({"error": "forbidden"}, 403)
         self.send_file(full, cache=True)
+
+    def thumb(self, idx):
+        item = get_item(idx)
+        if item is None or item.get("moved"):
+            return self.send_json({"error": "not found"}, 404)
+        full = (ROOT / item["path"]).resolve()
+        if ROOT not in full.parents:
+            return self.send_json({"error": "forbidden"}, 403)
+        t = make_thumb(item)
+        if t:
+            return self.send_file(t, cache=True)
+        if item["kind"] == "image":  # no ffmpeg or it failed: the original still works
+            return self.send_file(full, cache=True)
+        self.send_json({"error": "no thumbnail"}, 404)
 
     def send_file(self, path: Path, cache=False):
         if not path.is_file():
@@ -305,11 +395,23 @@ def main():
     global ROOT
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser()
-    ap.add_argument("folder", help="folder containing your images/videos")
+    ap.add_argument("folder", nargs="?", help="folder with your images/videos; used only when no folder was saved "
+                    "from a previous run (see --reset)")
+    ap.add_argument("--reset", action="store_true", help="ignore the saved folder and use FOLDER")
     args = ap.parse_args()
-    ROOT = Path(args.folder).expanduser().resolve()
+    saved = None if args.reset else load_state().get("folder")
+    if saved and Path(saved).is_dir():
+        ROOT = Path(saved).resolve()
+        log.info("Using saved folder %s", ROOT)
+    elif args.folder:
+        ROOT = Path(args.folder).expanduser().resolve()
+    else:
+        raise SystemExit("No folder given and none saved. Usage: server.py /path/to/media")
     if not ROOT.is_dir():
         raise SystemExit(f"Not a folder: {ROOT}")
+    save_state(folder=str(ROOT))
+    if not FFMPEG:
+        log.warning("ffmpeg not found: tiles will load full-size originals and videos will have no posters")
     t = time.perf_counter()
     n = scan()
     log.info("Indexed %d files in %.1fs", n, time.perf_counter() - t)
