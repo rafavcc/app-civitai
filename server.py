@@ -393,6 +393,7 @@ class Handler(BaseHTTPRequestHandler):
         search = q.get("q", [""])[0].lower().strip()
         with LOCK:
             indexed = [t for t in enumerate(ITEMS) if not t[1].get("moved")]
+            ver = SCAN_VERSION  # same snapshot as ITEMS
         if kind in ("image", "video"):
             indexed = [t for t in indexed if t[1]["kind"] == kind]
         if search:
@@ -409,7 +410,7 @@ class Handler(BaseHTTPRequestHandler):
         page = indexed[offset:offset + limit]
         self.send_json({
             "total": len(indexed),
-            "ver": SCAN_VERSION,
+            "ver": ver,
             "items": [{"id": i, **it} for i, it in page],
         })
 

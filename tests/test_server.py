@@ -88,6 +88,9 @@ class ScanAndItems(GalleryTestCase):
         names = {i["name"] for i in self.items()["items"]}
         self.assertEqual(names, {"a.png", "bb.png", "clip.mp4"})
 
+    def test_items_ver_matches_current_scan_version(self):
+        self.assertEqual(self.items()["ver"], server.SCAN_VERSION)
+
     def test_pagination(self):
         r = self.items(sort="name", limit=2, offset=0)
         self.assertEqual(r["total"], 3)
