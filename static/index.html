@@ -27,12 +27,15 @@
     <span id="count"></span>
   </div>
 </header>
+<div id="selbar"><button id="selback" title="Done">✕</button><span id="selcount">0 selected</span><button id="selmove">Move</button><button id="seldel">Delete</button></div>
 <div id="wrap"><div id="grid"></div></div>
 <div id="sentinel"></div>
 <div id="status"></div>
 <div id="lb"><div id="lbbar"><button id="backbtn">← Back</button><button id="delbtn">Delete</button><button id="mvbtn">Move</button></div><div id="lbmedia"></div><div id="lbinfo"></div></div>
 <div id="toast"></div>
 <div id="mv"><div id="mvhead"><b id="mvtitle">Move to folder</b><button id="mvclose" class="fbtn" style="padding:6px 12px">Cancel</button></div><div id="mvcrumbs"></div><button id="mvhere" class="fbtn here"></button><div id="mvgrid"></div></div>
+<div id="confirm" class="scrim"><div class="sheet" role="dialog" aria-modal="true" aria-labelledby="ctitle"><div id="cstack"></div><h3 id="ctitle"></h3><p id="cbody">They'll be deleted for good. This can't be undone.</p><div class="cbtns"><button id="ccancel">Cancel</button><button id="cok">Delete</button></div></div></div>
 <script src="/static/app.js"></script>
+<script src="/static/select.js"></script>
 </body>
 </html>

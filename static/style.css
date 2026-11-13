@@ -4,6 +4,7 @@
 
   @media (prefers-reduced-motion: reduce) {
     * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+    .tile.sel::before, #selbar { animation: none !important; }
   }
   header { position: sticky; top: 0; z-index: 10; display: flex; flex-direction: column; gap: 6px;
            padding: calc(8px + var(--sat)) calc(16px + var(--sar)) 8px calc(16px + var(--sal)); background: #141517; border-bottom: 1px solid #2c2e33; }
@@ -40,6 +41,7 @@
   #mv { position: fixed; inset: 0; background: rgba(0,0,0,.94); display: none; z-index: 30; flex-direction: column; padding: calc(16px + var(--sat)) calc(16px + var(--sar)) calc(16px + var(--sab)) calc(16px + var(--sal)); overflow-y: auto; }
   #mv.open { display: flex; }
   #toast { position: fixed; bottom: calc(24px + var(--sab)); left: 50%; transform: translateX(-50%); background: #c92a2a; color: #fff; padding: 8px 14px; border-radius: 8px; font-size: 14px; z-index: 40; display: none; }
+  #toast.ok { background: #2b2d31; border: 1px solid #373a40; }
   #mvhead { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
   #mvgrid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); }
   #mvcrumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; margin-bottom: 10px; font-size: 15px; }
@@ -52,3 +54,45 @@
   .fbtn:hover { outline: 2px solid #4dabf7; }
   .fbtn.cur { opacity: .5; }
   .fbtn.red { background: #5c1a1a; border-color: #c92a2a; color: #ffa8a8; }
+  .scrim { position: fixed; inset: 0; z-index: 35; background: rgba(0,0,0,.55); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); display: none; align-items: end; justify-items: center; }
+  .scrim.open { display: grid; }
+  .sheet { width: 100%; max-width: 420px; background: #1a1b1e; border: 1px solid #373a40; border-radius: 16px 16px 0 0; padding: 22px 18px calc(18px + var(--sab)); text-align: center; }
+  .sheet h3 { margin: 10px 0 6px; font-size: 18px; }
+  .sheet p { margin: 0 0 18px; font-size: 14px; opacity: .7; }
+  #cstack { display: flex; justify-content: center; align-items: center; height: 84px; margin-bottom: 8px; }
+  #cstack img, #cstack .more { width: 64px; height: 64px; object-fit: cover; border-radius: 8px; border: 2px solid #1a1b1e; background: #25262b; margin-left: -18px; box-shadow: 0 2px 8px rgba(0,0,0,.5); }
+  #cstack > :first-child { margin-left: 0; }
+  #cstack > :nth-child(odd) { transform: rotate(-6deg); }
+  #cstack > :nth-child(even) { transform: rotate(5deg); }
+  #cstack .more { display: grid; place-items: center; font-size: 15px; font-weight: 600; }
+  .cbtns { display: flex; gap: 10px; }
+  .cbtns button { flex: 1; padding: 12px; border-radius: 10px; font-size: 15px; cursor: pointer; background: #25262b; color: inherit; border: 1px solid #373a40; }
+  #cok { background: #c92a2a; border-color: #c92a2a; color: #fff; font-weight: 600; }
+  @media (min-width: 701px) { .scrim { align-items: center; } .sheet { border-radius: 16px; padding-bottom: 18px; } }
+
+  /* Multi-select: spinning rainbow ring, selection bar, press feedback.
+     The gradient is declared on every element (not :root) so --a is re-resolved where it animates. */
+  @property --a { syntax: '<angle>'; inherits: true; initial-value: 0deg; }
+  @keyframes spin { to { --a: 360deg; } }
+  *, *::before, *::after { --rainbow: conic-gradient(from var(--a, 0deg), #ff2d55, #ff9500, #ffd60a, #30d158, #64d2ff, #5e5ce6, #bf5af2, #ff2d55); }
+  .tile, .tile img, .tile video { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+  .tile { isolation: isolate; }
+  .tile img, .tile video { transition: transform .25s cubic-bezier(.2,.8,.2,1), filter .25s; }
+  .tile::before { content: ''; position: absolute; inset: 0; border-radius: inherit; padding: 3px; background: var(--rainbow);
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask-composite: exclude;
+    opacity: 0; transform: scale(1.08); transition: opacity .2s, transform .25s cubic-bezier(.2,.8,.2,1); z-index: 3; pointer-events: none; }
+  .tile.sel::before { opacity: 1; transform: none; animation: spin 2.6s linear infinite; }
+  .tile.sel:hover { outline: none; }
+  .tile.pressing img, .tile.pressing video { transform: scale(.94); filter: brightness(.8); transition-duration: .45s; }
+  #selbar { display: none; position: sticky; top: 0; z-index: 10; align-items: center; gap: 8px;
+    padding: calc(10px + var(--sat)) calc(10px + var(--sar)) 10px calc(10px + var(--sal));
+    background: rgba(20,21,23,.86); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+    border-bottom: 1px solid transparent; border-image: var(--rainbow) 1; animation: spin 4s linear infinite; }
+  body.selecting header { display: none; }
+  body.selecting #selbar { display: flex; }
+  #selbar button { border: 0; border-radius: 8px; padding: 8px 12px; font-size: 14px; font-weight: 600; cursor: pointer; color: #fff; background: rgba(255,255,255,.08); }
+  #selbar button:hover { background: rgba(255,255,255,.16); }
+  #selback { background: transparent !important; color: #c1c2c5 !important; }
+  #selcount { flex: 1; text-align: center; font-weight: 600; color: #fff; font-size: 16px; font-variant-numeric: tabular-nums; }
+  #seldel { background: #e03131 !important; }
+  #selbar button:disabled { opacity: .35; pointer-events: none; }

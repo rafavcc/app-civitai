@@ -36,7 +36,9 @@ BASE: Path = Path(".")  # fixed top-level folder; nothing outside it is ever ser
 ROOT: Path = Path(".")  # folder currently shown (BASE or a subfolder); only its own files are listed
 ITEMS: list[dict] = []
 LOCK = threading.Lock()
-SCAN_VERSION = 0
+# Unique per process (microseconds since the epoch, exact as a JS number): a page left open across a
+# restart must never hold a `ver` that matches the new process's list
+SCAN_VERSION = time.time_ns() // 1000
 FFMPEG = shutil.which("ffmpeg")
 THUMB_SLOTS = threading.Semaphore(4)  # bound concurrent ffmpeg processes
 log = logging.getLogger("gallery")
@@ -67,6 +69,27 @@ def get_item(idx):
 def thumb_path(item):
     key = hashlib.sha1(f"{ROOT}|{item['path']}|{item['mtime']}|{item['size']}".encode()).hexdigest()
     return CACHE_DIR / key[:2] / f"{key}.jpg"
+
+
+def drop_thumb(item):
+    # A deleted file's cached thumbnail would otherwise linger forever
+    try:
+        thumb_path(item).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def parse_ids(body):
+    """Validates the ids/ver fields of a batch request. Raises ValueError."""
+    ids, ver = body.get("ids"), body.get("ver")
+    if not isinstance(ids, list) or not ids:
+        raise ValueError("ids must be a non-empty list")
+    # bool is a subclass of int, so it has to be excluded explicitly
+    if any(not isinstance(i, int) or isinstance(i, bool) for i in ids):
+        raise ValueError("ids must be integers")
+    if not isinstance(ver, int) or isinstance(ver, bool):
+        raise ValueError("ver must be an integer")
+    return ids
 
 
 def make_thumb(item):
@@ -119,9 +142,12 @@ def rel_of(p):
     return "" if p == BASE else p.relative_to(BASE).as_posix()
 
 
-def scan():
+def scan(root=None):
+    """Indexes `root` (default: the current folder) and swaps ROOT, ITEMS and SCAN_VERSION together under LOCK."""
+    global ROOT, SCAN_VERSION
+    root = ROOT if root is None else root
     items = []
-    with os.scandir(ROOT) as it:
+    with os.scandir(root) as it:
         for e in it:
             if e.name.startswith(".") or not e.is_file():
                 continue
@@ -140,12 +166,18 @@ def scan():
                 "size": st.st_size,
             })
     items.sort(key=lambda i: i["mtime"], reverse=True)
-    global SCAN_VERSION
     with LOCK:
+        ROOT = root
         ITEMS[:] = items
         SCAN_VERSION += 1
-    log.info("Scanned %s: %d files", ROOT, len(items))
+    log.info("Scanned %s: %d files", root, len(items))
     return len(items)
+
+
+class HttpError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status, self.message = status, message
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -202,14 +234,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         url = urlparse(self.path)
-        q = parse_qs(url.query, keep_blank_values=True)  # an empty path means the top-level folder
         try:
             if url.path == "/api/move":
-                return self.move_item(int(q["id"][0]), q["dest"][0])
+                return self.move_items(self.read_json_body())
             if url.path == "/api/delete":
-                return self.delete_item(int(q["id"][0]))
+                return self.delete_items(self.read_json_body())
         except (BrokenPipeError, ConnectionResetError):
             return
+        except HttpError as e:
+            return self.send_json({"error": e.message}, e.status)
         except ValueError:  # non-numeric ids and similar malformed input
             return self.send_json({"error": "bad request"}, 400)
         except Exception:
@@ -250,21 +283,77 @@ class Handler(BaseHTTPRequestHandler):
             crumbs.append({"name": part, "path": acc})
         self.send_json({"path": base_rel, "crumbs": crumbs, "folders": folders, "current": rel_of(ROOT)})
 
-    def move_item(self, idx, dest):
+    def read_json_body(self):
+        # Always consume the body before replying so a keep-alive connection stays in sync
+        try:
+            n = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self.close_connection = True
+            raise ValueError("Content-Length required")
+        if not 0 < n <= 1_000_000:
+            self.close_connection = True  # the body is left unread, so the stream can't be reused
+            raise ValueError("bad body size")
+        raw = self.rfile.read(n)
+        # CSRF guard: a cross-site form/fetch can only send "simple" requests (text/plain etc.) with no
+        # preflight, so demanding JSON forces a preflight this server never approves; also refuse foreign origins
+        origin = self.headers.get("Origin")
+        if origin is not None and urlparse(origin).netloc != self.headers.get("Host", ""):
+            raise HttpError(403, "Forbidden origin")
+        if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+            raise HttpError(415, "Unsupported media type")
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            raise ValueError("invalid JSON")
+        if not isinstance(body, dict):
+            raise ValueError("body must be an object")
+        return body
+
+    def batch(self, body, dest_dir, one):
+        """Runs one(item, src) for each id under LOCK; replies with per-id results or 409 on a stale scan."""
+        ids = parse_ids(body)
+        with LOCK:
+            if body["ver"] != SCAN_VERSION:
+                return self.send_json({"error": "Folder changed — reload to continue"}, 409)
+            results = []
+            for idx in ids:
+                r = {"id": idx, "ok": False}
+                item = ITEMS[idx] if 0 <= idx < len(ITEMS) else None
+                try:
+                    if item is None:
+                        r["error"] = "File not found"
+                    elif item.get("moved"):
+                        r["error"] = "Already moved"
+                    elif (ROOT / item["path"]).is_symlink():
+                        r["error"] = "Symlinks are not supported"  # resolving would act on the link's target
+                    else:
+                        src = (ROOT / item["path"]).resolve()
+                        if ROOT not in src.parents or not src.is_file():
+                            r["error"] = "File not found"
+                        elif dest_dir is not None and src.parent == dest_dir:
+                            r["error"] = "File is already in that folder"
+                        else:
+                            one(item, src)
+                            item["moved"] = True
+                            r = {"id": idx, "ok": True}
+                except OSError as e:
+                    log.warning("Failed on %s: %s", item and item["path"], e)
+                    r["error"] = "File not found" if item is None else f"Could not process file: {e.strerror or e}"
+                results.append(r)
+        done = sum(r["ok"] for r in results)
+        log.info("%s: %d of %d files", self.path, done, len(results))
+        self.send_json({"results": results})
+
+    def move_items(self, body):
+        parse_ids(body)
+        dest = body.get("dest")
+        if not isinstance(dest, str):
+            raise ValueError("dest must be a string")
         dest_dir = resolve_rel(dest)
         if dest_dir is None:
             return self.send_json({"error": "Invalid destination folder"}, 400)
-        with LOCK:
-            item = ITEMS[idx] if 0 <= idx < len(ITEMS) else None
-            if item is None:
-                return self.send_json({"error": "File not found"}, 404)
-            if item.get("moved"):
-                return self.send_json({"error": "Already moved"}, 409)
-            src = (ROOT / item["path"]).resolve()
-            if ROOT not in src.parents or not src.is_file():
-                return self.send_json({"error": "File not found"}, 404)
-            if src.parent == dest_dir:
-                return self.send_json({"error": "File is already in that folder"}, 400)
+
+        def one(item, src):
             target = dest_dir / src.name
             n = 1
             while target.exists():
@@ -272,38 +361,23 @@ class Handler(BaseHTTPRequestHandler):
                 n += 1
             shutil.move(str(src), str(target))
             log.info("Moved %s -> %s", src, target)
-            item["moved"] = True
-        self.send_json({"ok": True, "moved": True, "to": str(target)})
 
-    def delete_item(self, idx):
-        # Deleted files go to a hidden .trash folder at the top-level folder, so they stay recoverable
-        trash = BASE / ".trash"
-        with LOCK:
-            item = ITEMS[idx] if 0 <= idx < len(ITEMS) else None
-            if item is None:
-                return self.send_json({"error": "File not found"}, 404)
-            if item.get("moved"):
-                return self.send_json({"error": "Already moved"}, 409)
-            src = (ROOT / item["path"]).resolve()
-            if ROOT not in src.parents or not src.is_file():
-                return self.send_json({"error": "File not found"}, 404)
-            trash.mkdir(exist_ok=True)
-            target = trash / src.name
-            n = 1
-            while target.exists():
-                target = trash / f"{src.stem}_{n}{src.suffix}"
-                n += 1
-            shutil.move(str(src), str(target))
-            item["moved"] = True
-        log.info("Deleted %s -> %s", src, target)
-        self.send_json({"ok": True})
+        self.batch(body, dest_dir, one)
+
+    def delete_items(self, body):
+        def one(item, src):
+            os.unlink(src)
+            drop_thumb(item)
+            log.info("Deleted %s", src)
+
+        self.batch(body, None, one)
 
     def set_folder(self, path):
-        global ROOT
-        ROOT = Path(path)
-        save_state(folder=str(ROOT))
-        log.info("Folder changed to %s", ROOT)
-        self.send_json({"folder": str(ROOT), "path": rel_of(ROOT), "count": scan()})
+        new = Path(path)
+        count = scan(new)  # swaps ROOT/ITEMS/SCAN_VERSION atomically once the walk is done
+        save_state(folder=str(new))
+        log.info("Folder changed to %s", new)
+        self.send_json({"folder": str(new), "path": rel_of(new), "count": count})
 
     def switch_folder(self, rel):
         new = resolve_rel(rel)
@@ -319,6 +393,7 @@ class Handler(BaseHTTPRequestHandler):
         search = q.get("q", [""])[0].lower().strip()
         with LOCK:
             indexed = [t for t in enumerate(ITEMS) if not t[1].get("moved")]
+            ver = SCAN_VERSION  # same snapshot as ITEMS
         if kind in ("image", "video"):
             indexed = [t for t in indexed if t[1]["kind"] == kind]
         if search:
@@ -335,7 +410,7 @@ class Handler(BaseHTTPRequestHandler):
         page = indexed[offset:offset + limit]
         self.send_json({
             "total": len(indexed),
-            "ver": SCAN_VERSION,
+            "ver": ver,
             "items": [{"id": i, **it} for i, it in page],
         })
 

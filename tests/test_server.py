@@ -38,6 +38,16 @@ def jget(url, **kw):
     return status, json.loads(body)
 
 
+def post_json(url, body, raw=None):
+    data = raw if raw is not None else json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
 class GalleryTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp()).resolve()
@@ -77,6 +87,9 @@ class ScanAndItems(GalleryTestCase):
     def test_scan_is_not_recursive_and_skips_hidden_and_non_media(self):
         names = {i["name"] for i in self.items()["items"]}
         self.assertEqual(names, {"a.png", "bb.png", "clip.mp4"})
+
+    def test_items_ver_matches_current_scan_version(self):
+        self.assertEqual(self.items()["ver"], server.SCAN_VERSION)
 
     def test_pagination(self):
         r = self.items(sort="name", limit=2, offset=0)
@@ -175,37 +188,147 @@ class MediaServing(GalleryTestCase):
 
 
 class Actions(GalleryTestCase):
-    def post(self, path):
-        return jget(f"{self.base}{path}", method="POST")
+    def post(self, path, body):
+        return post_json(f"{self.base}{path}", body)
 
     def id_of(self, name):
         return next(i["id"] for i in self.items()["items"] if i["name"] == name)
 
-    def test_delete_goes_to_trash(self):
-        status, r = self.post(f"/api/delete?id={self.id_of('a.png')}")
+    def ids(self, *names):
+        return [self.id_of(n) for n in names]
+
+    def ver(self):
+        return self.items()["ver"]
+
+    def test_delete_is_permanent(self):
+        aid = self.id_of("a.png")
+        status, r = self.post("/api/delete", {"ids": [aid], "ver": self.ver()})
         self.assertEqual(status, 200)
+        self.assertEqual(r["results"], [{"id": aid, "ok": True}])
         self.assertFalse((self.root / "a.png").exists())
-        self.assertTrue((self.tmp / ".trash" / "a.png").exists())
+        self.assertFalse((self.tmp / ".trash").exists())
         self.assertEqual(self.items()["total"], 2)
 
     def test_move_to_sibling_folder(self):
-        status, r = self.post(f"/api/move?id={self.id_of('bb.png')}&dest=other")
+        status, r = self.post("/api/move", {"ids": self.ids("bb.png"), "dest": "other", "ver": self.ver()})
         self.assertEqual(status, 200)
+        self.assertTrue(r["results"][0]["ok"])
         self.assertTrue((self.tmp / "other" / "bb.png").exists())
 
     def test_move_into_nested_folder(self):
         (self.tmp / "other" / "deep").mkdir()
-        status, _ = self.post(f"/api/move?id={self.id_of('bb.png')}&dest=other/deep")
+        status, _ = self.post("/api/move", {"ids": self.ids("bb.png"), "dest": "other/deep", "ver": self.ver()})
         self.assertEqual(status, 200)
         self.assertTrue((self.tmp / "other" / "deep" / "bb.png").exists())
 
     def test_move_rejects_bad_destination_and_ids(self):
-        mid = self.id_of("bb.png")
+        mid, ver = self.id_of("bb.png"), self.ver()
         for dest in ("..", ".trash", "nope", "../x", "other/../..", "/etc"):
-            status, _ = self.post(f"/api/move?id={mid}&dest={dest}")
+            status, _ = self.post("/api/move", {"ids": [mid], "dest": dest, "ver": ver})
             self.assertEqual(status, 400, dest)
-        self.assertEqual(self.post("/api/delete?id=-1")[0], 404)
-        self.assertEqual(self.post("/api/delete?id=999")[0], 404)
+        self.assertTrue((self.root / "bb.png").exists())
+        self.assertEqual(list((self.tmp / "other").iterdir()), [])
+        # Unknown ids are reported per file, not as a failed request
+        status, r = self.post("/api/delete", {"ids": [-1, 999], "ver": ver})
+        self.assertEqual(status, 200)
+        self.assertEqual([x["ok"] for x in r["results"]], [False, False])
+
+    def test_batch_move_mixed_kinds(self):
+        ids = self.ids("a.png", "bb.png", "clip.mp4")
+        status, r = self.post("/api/move", {"ids": ids, "dest": "other", "ver": self.ver()})
+        self.assertEqual(status, 200)
+        self.assertEqual([x["ok"] for x in r["results"]], [True, True, True])
+        for n in ("a.png", "bb.png", "clip.mp4"):
+            self.assertTrue((self.tmp / "other" / n).exists(), n)
+        self.assertEqual(self.items()["total"], 0)
+
+    def test_batch_delete_several(self):
+        status, r = self.post("/api/delete", {"ids": self.ids("a.png", "clip.mp4"), "ver": self.ver()})
+        self.assertEqual(status, 200)
+        self.assertFalse((self.root / "a.png").exists())
+        self.assertFalse((self.root / "clip.mp4").exists())
+        self.assertTrue((self.root / "bb.png").exists())
+
+    def test_stale_ver_is_409_and_touches_nothing(self):
+        old = self.ver()
+        jget(f"{self.base}/api/rescan")
+        ids = self.ids("a.png", "bb.png", "clip.mp4")
+        status, r = self.post("/api/delete", {"ids": ids, "ver": old})
+        self.assertEqual(status, 409)
+        self.assertEqual(r["error"], "Folder changed — reload to continue")
+        for n in ("a.png", "bb.png", "clip.mp4"):
+            self.assertTrue((self.root / n).exists(), n)
+
+    def test_partial_failure_reports_per_file(self):
+        aid = self.id_of("a.png")
+        status, r = self.post("/api/delete", {"ids": [aid, 9999, -1], "ver": self.ver()})
+        self.assertEqual(status, 200)
+        res = r["results"]
+        self.assertEqual(res[0], {"id": aid, "ok": True})
+        for x in res[1:]:
+            self.assertEqual((x["ok"], x["error"]), (False, "File not found"))
+        self.assertFalse((self.root / "a.png").exists())
+
+    def test_duplicate_ids_do_not_crash(self):
+        aid = self.id_of("a.png")
+        status, r = self.post("/api/move", {"ids": [aid, aid], "dest": "other", "ver": self.ver()})
+        self.assertEqual(status, 200)
+        self.assertTrue(r["results"][0]["ok"])
+        self.assertFalse(r["results"][1]["ok"])
+        self.assertEqual([p.name for p in (self.tmp / "other").iterdir()], ["a.png"])
+        status, r = self.post("/api/delete", {"ids": [self.ids("bb.png")[0]] * 2, "ver": self.ver()})
+        self.assertEqual(status, 200)
+        self.assertEqual([x["ok"] for x in r["results"]], [True, False])
+
+    def test_malformed_bodies_are_400(self):
+        v, aid = self.ver(), self.id_of("a.png")
+        url = f"{self.base}/api/delete"
+        bodies = [{"ids": "3", "ver": v}, {"ids": [], "ver": v}, {"ids": ["3"], "ver": v},
+                  {"ids": [None], "ver": v}, {"ids": [True], "ver": v}, {"ids": [aid]}, {"ver": v}]
+        self.assertEqual(post_json(url, None, raw=b"not json")[0], 400)
+        for b in bodies:
+            self.assertEqual(post_json(url, b)[0], 400, b)
+        self.assertTrue((self.root / "a.png").exists())
+        self.assertEqual(post_json(url, {"ids": [aid], "ver": v})[0], 200)
+
+    def test_vanished_file_fails_only_that_id(self):
+        aid, bid = self.ids("a.png", "bb.png")
+        os.unlink(self.root / "a.png")
+        status, r = self.post("/api/delete", {"ids": [aid, bid], "ver": self.ver()})
+        self.assertEqual(status, 200)
+        self.assertEqual((r["results"][0]["ok"], r["results"][0]["error"]), (False, "File not found"))
+        self.assertTrue(r["results"][1]["ok"])
+
+    def test_name_clash_gets_suffix(self):
+        (self.tmp / "other" / "bb.png").write_bytes(PNG)
+        status, r = self.post("/api/move", {"ids": self.ids("bb.png"), "dest": "other", "ver": self.ver()})
+        self.assertEqual(status, 200)
+        self.assertTrue((self.tmp / "other" / "bb.png").exists())
+        self.assertTrue((self.tmp / "other" / "bb_1.png").exists())
+
+    def test_move_to_current_folder_fails_per_file(self):
+        aid = self.id_of("a.png")
+        status, r = self.post("/api/move", {"ids": [aid], "dest": "main", "ver": self.ver()})
+        self.assertEqual(status, 200)
+        self.assertEqual((r["results"][0]["ok"], r["results"][0]["error"]),
+                         (False, "File is already in that folder"))
+        self.assertTrue((self.root / "a.png").exists())
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_delete_removes_cached_thumbnail(self):
+        server.FFMPEG = shutil.which("ffmpeg")
+        img = self.tmp / "big.jpg"
+        subprocess.run([server.FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=red:s=1600x900",
+                        "-frames:v", "1", str(img)], check=True)
+        shutil.copy(img, self.root / "big.jpg")
+        server.scan()
+        tid = self.id_of("big.jpg")
+        get(f"{self.base}/thumb/{tid}")
+        cache = server.thumb_path(server.ITEMS[tid])
+        self.assertTrue(cache.exists())
+        status, _ = self.post("/api/delete", {"ids": [tid], "ver": self.ver()})
+        self.assertEqual(status, 200)
+        self.assertFalse(cache.exists())
 
     def test_switch_folder_persists_state(self):
         (self.tmp / "other" / "z.png").write_bytes(PNG)
@@ -214,6 +337,108 @@ class Actions(GalleryTestCase):
         self.assertEqual(server.load_state()["folder"], str(self.tmp / "other"))
         status, r = jget(f"{self.base}/api/folder?path=")
         self.assertEqual((status, r["path"]), (200, ""))
+
+
+class Hardening(GalleryTestCase):
+    """Guards that keep a stale or foreign request from deleting the wrong file."""
+
+    def post(self, path, body):
+        return post_json(f"{self.base}{path}", body)
+
+    def id_of(self, name):
+        return next(i["id"] for i in self.items()["items"] if i["name"] == name)
+
+    def ver(self):
+        return self.items()["ver"]
+
+    def raw_post(self, path, data, headers):
+        req = urllib.request.Request(f"{self.base}{path}", data=data, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_scan_version_is_unique_per_process(self):
+        code = "import server; print(server.SCAN_VERSION)"
+        root = str(Path(__file__).resolve().parent.parent)
+        vals = [int(subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True,
+                                   text=True, check=True).stdout) for _ in range(2)]
+        for v in vals:
+            self.assertGreater(v, 10**12)
+            self.assertLess(v, 2**53)
+        self.assertNotEqual(vals[0], vals[1])
+
+    def test_folder_switch_never_pairs_new_root_with_old_items(self):
+        (self.tmp / "other" / "a.png").write_bytes(PNG * 3)  # same name as an item of the old folder
+        aid, old = self.id_of("a.png"), self.ver()
+        entered, release = threading.Event(), threading.Event()
+        real = os.scandir
+        target = str(self.tmp / "other")
+
+        def slow(path):
+            if str(path) == target:
+                entered.set()
+                release.wait(5)
+            return real(path)
+
+        server.os.scandir = slow
+        try:
+            t = threading.Thread(target=jget, args=(f"{self.base}/api/folder?path=other",))
+            t.start()
+            self.assertTrue(entered.wait(5))
+            status, _ = self.post("/api/delete", {"ids": [aid], "ver": old})
+            release.set()
+            t.join(5)
+        finally:
+            server.os.scandir = real
+            release.set()
+        self.assertIn(status, (200, 409))
+        self.assertEqual((self.tmp / "other" / "a.png").read_bytes(), PNG * 3)
+
+    def test_text_plain_body_is_415_and_touches_nothing(self):
+        body = json.dumps({"ids": [self.id_of("a.png")], "ver": self.ver()}).encode()
+        for ct in ("text/plain", "application/x-www-form-urlencoded"):
+            status, r = self.raw_post("/api/delete", body, {"Content-Type": ct})
+            self.assertEqual((status, r["error"]), (415, "Unsupported media type"), ct)
+        self.assertTrue((self.root / "a.png").exists())
+        status, _ = self.raw_post("/api/delete", body, {"Content-Type": "Application/JSON; charset=utf-8"})
+        self.assertEqual(status, 200)
+
+    def test_foreign_origin_is_403_and_same_origin_works(self):
+        body = json.dumps({"ids": [self.id_of("a.png")], "ver": self.ver()}).encode()
+        h = {"Content-Type": "application/json"}
+        status, _ = self.raw_post("/api/delete", body, {**h, "Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertTrue((self.root / "a.png").exists())
+        status, _ = self.raw_post("/api/delete", body, {**h, "Origin": self.base})
+        self.assertEqual(status, 200)
+        self.assertFalse((self.root / "a.png").exists())
+
+    def test_symlink_is_refused_and_target_survives(self):
+        os.symlink(self.root / "a.png", self.root / "link.png")
+        server.scan()
+        lid, v = self.id_of("link.png"), self.ver()
+        for path, extra in (("/api/delete", {}), ("/api/move", {"dest": "other"})):
+            status, r = self.post(path, {"ids": [lid], "ver": v, **extra})
+            self.assertEqual(status, 200)
+            self.assertEqual((r["results"][0]["ok"], r["results"][0]["error"]),
+                             (False, "Symlinks are not supported"), path)
+        self.assertTrue((self.root / "a.png").exists())
+        self.assertTrue((self.root / "link.png").is_symlink())
+
+    def test_oversize_body_closes_the_connection(self):
+        import socket
+        with socket.create_connection(self.srv.server_address, timeout=2) as s:
+            s.sendall(b"POST /api/delete HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                      b"Content-Length: 2000000\r\n\r\n")
+            data = b""
+            try:
+                while chunk := s.recv(4096):
+                    data += chunk
+            except socket.timeout:
+                self.fail("connection left open with an unread body")
+        self.assertIn(b"400", data.split(b"\r\n")[0])
 
 
 class Navigation(GalleryTestCase):
@@ -279,11 +504,13 @@ class Navigation(GalleryTestCase):
             self.assertEqual(jget(f"{self.base}/api/folder?path={bad}")[0], 400, bad)
         self.assertEqual(server.ROOT, self.root)  # a rejected request must not change the folder
 
-    def test_delete_trash_is_at_base(self):
+    def test_delete_in_subfolder_is_permanent(self):
         jget(f"{self.base}/api/folder?path=other/deep")
-        item = self.items()["items"][0]
-        self.assertEqual(jget(f"{self.base}/api/delete?id={item['id']}", method="POST")[0], 200)
-        self.assertTrue((self.tmp / ".trash" / "z.png").exists())
+        data = self.items()
+        status, _ = post_json(f"{self.base}/api/delete", {"ids": [data["items"][0]["id"]], "ver": data["ver"]})
+        self.assertEqual(status, 200)
+        self.assertFalse((self.tmp / "other" / "deep" / "z.png").exists())
+        self.assertEqual(list(self.tmp.rglob(".trash")), [])
 
 
 

@@ -17,6 +17,14 @@ async function loadMore() {
     return;
   }
   if (g !== gen) { loading = false; return; }
+  if (listed.length > 0 && r.ver !== ver) {
+    // The folder changed under us: adopting the new ver would let the old, still-selected tiles act on
+    // whatever the new list holds at their ids. Keep the old ver (so actions get the server's 409) and stop.
+    done = true;
+    loading = false;
+    toast('Folder changed — reload to continue');
+    return;
+  }
   total = r.total;
   ver = r.ver;
   for (const it of r.items) { listed.push(it); $('grid').appendChild(tile(it, listed.length - 1)); }
@@ -66,7 +74,7 @@ function tile(it, index) {
   l.className = 'label';
   l.textContent = it.path;
   d.appendChild(l);
-  d.onclick = () => openLb(index);
+  d.dataset.index = index;
   it.el = d;
   return d;
 }
@@ -133,9 +141,10 @@ function dropItem(it) {
 }
 
 let toastTimer;
-function toast(msg) {
+function toast(msg, kind = 'error') {
   const t = $('toast');
   t.textContent = msg;
+  t.classList.toggle('ok', kind === 'ok');
   t.style.display = 'block';
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.style.display = 'none', 3000);
@@ -191,11 +200,10 @@ $('folder').onclick = () => pickFolder('Open folder', 'Open', null, async path =
 
 $('delbtn').onclick = async () => {
   const it = listed[cur];
-  if (!it) return;
-  const res = await (await fetch('/api/delete?id=' + it.id, { method: 'POST' })).json();
-  if (res.error) return toast(res.error);
-  closeLb();
-  dropItem(it);
+  if (!it || !await confirmDelete([it])) return;
+  const r = await batch('delete', [it]);
+  if (r?.ok.length) { closeLb(); toast('Deleted 1 file', 'ok'); }
+  else if (r?.failed.length) toast(r.failed[0].error);
 };
 
 function closeMv() { $('mv').classList.remove('open'); }
@@ -204,11 +212,10 @@ $('mvbtn').onclick = () => {
   const it = listed[cur];
   if (!it) return;
   pickFolder('Move to folder', 'Move here', '', async dest => {
-    const res = await (await fetch('/api/move?' + new URLSearchParams({ id: it.id, dest }), { method: 'POST' })).json();
-    if (res.error) return toast(res.error);
-    closeMv();
-    closeLb();
-    if (res.moved) dropItem(it);
+    const r = await batch('move', [it], { dest });
+    if (!r) return;
+    if (r.ok.length) { closeMv(); closeLb(); toast('Moved 1 file', 'ok'); }
+    else if (r.failed.length) toast(r.failed[0].error);
   });
 };
 
@@ -223,7 +230,7 @@ function autoStep(now) {
   requestAnimationFrame(autoStep);
   const dt = Math.min(now - autoLast, 100) / 1000;
   autoLast = now;
-  if (cur >= 0 || $('mv').classList.contains('open')) { autoPos = scrollY; return; }
+  if (cur >= 0 || Sel.active || $('mv').classList.contains('open')) { autoPos = scrollY; return; }
   // Re-sync when the user scrolled manually or the page was reset
   if (Math.abs(scrollY - autoPos) > 2) autoPos = scrollY;
   const tile = $('grid').firstElementChild;
