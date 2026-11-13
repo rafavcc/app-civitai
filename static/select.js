@@ -69,3 +69,120 @@ function confirmDelete(items) {
     $('ccancel').focus();
   });
 }
+
+// Selection mode: long-press / Ctrl-click starts it, then plain clicks toggle. State is a Set of `listed` entries.
+const picked = new Set();
+const Sel = {
+  active: false,
+  get size() { return picked.size; },
+  has: item => picked.has(item),
+  toggle(item) {
+    if (!item || item.moved) return;
+    if (picked.has(item)) picked.delete(item); else picked.add(item);
+    item.el.classList.toggle('sel', picked.has(item));
+    Sel.active = true;
+    document.body.classList.add('selecting');
+    $('selcount').textContent = picked.size + ' selected';
+    $('selmove').disabled = $('seldel').disabled = !picked.size;
+  },
+  clear() {
+    for (const it of picked) it.el.classList.remove('sel');
+    picked.clear();
+    Sel.active = false;
+    document.body.classList.remove('selecting');
+    $('selcount').textContent = '0 selected';
+  },
+};
+
+const grid = $('grid');
+const tileItem = e => {
+  const t = e.target.closest?.('.tile');
+  return t ? { t, item: listed[+t.dataset.index] } : null;
+};
+let pressTimer = 0, pressTile = null, pressX = 0, pressY = 0, swallowClick = false, lastToggle = 0, lastVia = '';
+
+function cancelPress() {
+  clearTimeout(pressTimer);
+  pressTile?.classList.remove('pressing');
+  pressTile = null;
+}
+grid.addEventListener('pointerdown', e => {
+  swallowClick = false;
+  if (Sel.active || e.button !== 0 || !e.isPrimary) return;
+  const hit = tileItem(e);
+  if (!hit) return;
+  cancelPress();
+  pressTile = hit.t; pressX = e.clientX; pressY = e.clientY;
+  hit.t.classList.add('pressing');
+  pressTimer = setTimeout(() => {
+    cancelPress();
+    swallowClick = true;
+    Sel.toggle(hit.item);
+    navigator.vibrate?.(12);
+  }, 450);
+});
+grid.addEventListener('pointermove', e => {
+  if (pressTile && Math.hypot(e.clientX - pressX, e.clientY - pressY) > 10) cancelPress();
+});
+for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) grid.addEventListener(ev, cancelPress);
+
+// One physical click can raise both click and contextmenu (Ctrl-click); toggle only once
+function tapToggle(item, via) {
+  const now = performance.now();
+  if (lastVia && lastVia !== via && now - lastToggle < 80) return;
+  lastToggle = now; lastVia = via;
+  Sel.toggle(item);
+}
+grid.addEventListener('click', e => {
+  const hit = tileItem(e);
+  if (!hit) return;
+  if (swallowClick) { swallowClick = false; return; }
+  if (Sel.active || e.metaKey || e.ctrlKey) { e.preventDefault(); tapToggle(hit.item, 'click'); }
+  else openLb(+hit.t.dataset.index);
+});
+grid.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  const hit = tileItem(e);
+  if (hit && e.ctrlKey && !swallowClick) tapToggle(hit.item, 'ctx');
+});
+grid.addEventListener('dragstart', e => { if (tileItem(e)) e.preventDefault(); });
+addEventListener('keydown', e => {
+  if (e.key !== 'Escape' || !Sel.active) return;
+  if (cur >= 0 || $('mv').classList.contains('open') || $('confirm').classList.contains('open')) return;
+  Sel.clear();
+});
+
+// A fresh listing invalidates the selection
+const resetListing = reset;
+reset = function () { Sel.clear(); return resetListing.apply(this, arguments); };
+
+$('selback').onclick = Sel.clear;
+
+// Report a batch outcome: drop finished items from the selection, keep failures selected
+function finishBatch(r, doneMsg) {
+  if (!r) return false;
+  for (const it of r.ok) { picked.delete(it); }
+  if (r.ok.length) toast(doneMsg(r.ok.length), 'ok');
+  if (r.failed.length) toast(`${r.failed.length} failed: ${r.failed[0].error}`);
+  if (picked.size) refreshBar();
+  else Sel.clear();
+  return r.ok.length > 0;
+}
+function refreshBar() {
+  $('selcount').textContent = picked.size + ' selected';
+  $('selmove').disabled = $('seldel').disabled = !picked.size;
+}
+
+$('seldel').onclick = async () => {
+  const items = [...picked];
+  if (!items.length || !await confirmDelete(items)) return;
+  finishBatch(await batch('delete', items), n => `Deleted ${plural(n)}`);
+};
+$('selmove').onclick = () => {
+  const items = [...picked];
+  if (!items.length) return;
+  pickFolder('Move ' + plural(items.length), 'Move here', '', async dest => {
+    const r = await batch('move', items, { dest });
+    if (finishBatch(r, n => `Moved ${plural(n)}`)) closeMv();
+  });
+};
