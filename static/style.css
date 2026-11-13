@@ -40,6 +40,7 @@
   #mv { position: fixed; inset: 0; background: rgba(0,0,0,.94); display: none; z-index: 30; flex-direction: column; padding: calc(16px + var(--sat)) calc(16px + var(--sar)) calc(16px + var(--sab)) calc(16px + var(--sal)); overflow-y: auto; }
   #mv.open { display: flex; }
   #toast { position: fixed; bottom: calc(24px + var(--sab)); left: 50%; transform: translateX(-50%); background: #c92a2a; color: #fff; padding: 8px 14px; border-radius: 8px; font-size: 14px; z-index: 40; display: none; }
+  #toast.ok { background: #2b2d31; border: 1px solid #373a40; }
   #mvhead { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
   #mvgrid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); }
   #mvcrumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; margin-bottom: 10px; font-size: 15px; }
@@ -52,3 +53,18 @@
   .fbtn:hover { outline: 2px solid #4dabf7; }
   .fbtn.cur { opacity: .5; }
   .fbtn.red { background: #5c1a1a; border-color: #c92a2a; color: #ffa8a8; }
+  .scrim { position: fixed; inset: 0; z-index: 35; background: rgba(0,0,0,.55); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); display: none; align-items: end; justify-items: center; }
+  .scrim.open { display: grid; }
+  .sheet { width: 100%; max-width: 420px; background: #1a1b1e; border: 1px solid #373a40; border-radius: 16px 16px 0 0; padding: 22px 18px calc(18px + var(--sab)); text-align: center; }
+  .sheet h3 { margin: 10px 0 6px; font-size: 18px; }
+  .sheet p { margin: 0 0 18px; font-size: 14px; opacity: .7; }
+  #cstack { display: flex; justify-content: center; align-items: center; height: 84px; margin-bottom: 8px; }
+  #cstack img, #cstack .more { width: 64px; height: 64px; object-fit: cover; border-radius: 8px; border: 2px solid #1a1b1e; background: #25262b; margin-left: -18px; box-shadow: 0 2px 8px rgba(0,0,0,.5); }
+  #cstack > :first-child { margin-left: 0; }
+  #cstack > :nth-child(odd) { transform: rotate(-6deg); }
+  #cstack > :nth-child(even) { transform: rotate(5deg); }
+  #cstack .more { display: grid; place-items: center; font-size: 15px; font-weight: 600; }
+  .cbtns { display: flex; gap: 10px; }
+  .cbtns button { flex: 1; padding: 12px; border-radius: 10px; font-size: 15px; cursor: pointer; background: #25262b; color: inherit; border: 1px solid #373a40; }
+  #cok { background: #c92a2a; border-color: #c92a2a; color: #fff; font-weight: 600; }
+  @media (min-width: 701px) { .scrim { align-items: center; } .sheet { border-radius: 16px; padding-bottom: 18px; } }

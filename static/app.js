@@ -66,7 +66,8 @@ function tile(it, index) {
   l.className = 'label';
   l.textContent = it.path;
   d.appendChild(l);
-  d.onclick = () => openLb(index);
+  d.dataset.index = index;
+  d.onclick = () => openLb(index); // temporary; replaced by delegated handling in select.js
   it.el = d;
   return d;
 }
@@ -133,9 +134,10 @@ function dropItem(it) {
 }
 
 let toastTimer;
-function toast(msg) {
+function toast(msg, kind = 'error') {
   const t = $('toast');
   t.textContent = msg;
+  t.classList.toggle('ok', kind === 'ok');
   t.style.display = 'block';
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.style.display = 'none', 3000);
@@ -191,11 +193,10 @@ $('folder').onclick = () => pickFolder('Open folder', 'Open', null, async path =
 
 $('delbtn').onclick = async () => {
   const it = listed[cur];
-  if (!it) return;
-  const res = await (await fetch('/api/delete?id=' + it.id, { method: 'POST' })).json();
-  if (res.error) return toast(res.error);
-  closeLb();
-  dropItem(it);
+  if (!it || !await confirmDelete([it])) return;
+  const r = await batch('delete', [it]);
+  if (r?.ok.length) { closeLb(); toast('Deleted 1 file', 'ok'); }
+  else if (r?.failed.length) toast(r.failed[0].error);
 };
 
 function closeMv() { $('mv').classList.remove('open'); }
@@ -204,11 +205,10 @@ $('mvbtn').onclick = () => {
   const it = listed[cur];
   if (!it) return;
   pickFolder('Move to folder', 'Move here', '', async dest => {
-    const res = await (await fetch('/api/move?' + new URLSearchParams({ id: it.id, dest }), { method: 'POST' })).json();
-    if (res.error) return toast(res.error);
-    closeMv();
-    closeLb();
-    if (res.moved) dropItem(it);
+    const r = await batch('move', [it], { dest });
+    if (!r) return;
+    if (r.ok.length) { closeMv(); closeLb(); toast('Moved 1 file', 'ok'); }
+    else if (r.failed.length) toast(r.failed[0].error);
   });
 };
 
