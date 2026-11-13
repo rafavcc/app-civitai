@@ -53,7 +53,7 @@ flowchart LR
     P["server.py: batch move/delete, ver guard, thumb cleanup"]
     T["tests/test_server.py"]
     N -->|uses globals| A
-    A -->|POST /api/move, /api/delete| P
+    A -->|lightbox calls batch, confirmDelete| N
     N -->|POST /api/move, /api/delete| P
     T -.->|tests| P
 ```
