@@ -22,7 +22,7 @@ The server listens on `0.0.0.0:8765` (constants at the top of `server.py`) and p
 - Dark theme, iOS meta tags, safe-area padding for the notch / Dynamic Island
 
 ## Multi-select
-Long-press a tile for about 0.45 s (or Ctrl/⌘-click on desktop) to start selecting. Selected tiles get a spinning rainbow ring and the header turns into `✕ · N selected · Move · Delete`. While selecting, a tap toggles a tile and never opens the lightbox. Only `✕` or Esc clears the selection.
+Long-press a tile for about 0.45 s (or Ctrl/⌘-click on desktop) to start selecting. Selected tiles get a spinning rainbow ring and the header turns into `✕ · N selected · Move · Delete`. While selecting, a tap toggles a tile and never opens the lightbox. Only `✕` or Esc clears it by hand (a new listing, or a finished action with nothing left selected, also ends it).
 
 > **Warning: Delete is permanent.** Files are removed from disk and cannot be restored. An old `.trash` folder from earlier versions is no longer used; you can delete it by hand.
 
@@ -39,12 +39,13 @@ stateDiagram-v2
     Selecting --> ConfirmDelete: Delete
     ConfirmDelete --> Selecting: Cancel, Esc or scrim
     ConfirmDelete --> Browsing: Delete, all files removed
-    ConfirmDelete --> Selecting: Delete, some files failed
+    ConfirmDelete --> Selecting: Delete, some files failed or 409
     Selecting --> FolderPicker: Move
-    FolderPicker --> Selecting: Cancel
+    FolderPicker --> Selecting: Cancel or Esc
+    FolderPicker --> FolderPicker: folder chosen, no file moved or 409, picker stays open
     FolderPicker --> Browsing: folder chosen, all files moved
-    FolderPicker --> Selecting: folder chosen, some files failed
-    Selecting --> Browsing: Back, Esc or new listing
+    FolderPicker --> Selecting: folder chosen, some moved and some failed
+    Selecting --> Browsing: ✕, Esc or new listing
 ```
 
 If some files fail, the ones that worked disappear from the grid, the failed ones stay selected and a toast says why. If the folder was rescanned or changed (stale `ver`, HTTP 409), nothing is touched and the selection is kept.
