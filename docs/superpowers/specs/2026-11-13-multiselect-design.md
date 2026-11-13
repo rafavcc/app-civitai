@@ -1,6 +1,6 @@
 # Multi-select: move and delete many files at once
 
-Date: 2026-11-13 · Status: draft, awaiting approval · Branch: `feature/multiselect`
+Date: 2026-11-13 · Status: approved, implemented on feature/multiselect (pending Rafael's review/merge) · Branch: `feature/multiselect`
 
 ## Why
 
@@ -41,7 +41,7 @@ Rafael sorts large folders of AI-generated images and videos, mostly from an iPh
 | Clearing | Only Back, or Esc on desktop |
 | Look of a selected tile | **A · Neon spin**: thin (3px) rotating rainbow ring; photo untouched |
 | Action bar | **2 · Header swap**: the header turns into `✕ · N selected · Move · Delete` |
-| Delete | Permanent. Confirmation sheet first ("Delete 12 files?" plus a small stack of thumbnails and "This can't be undone") |
+| Delete | Permanent. Confirmation sheet first ("Delete 12 files?" plus a small stack of thumbnails and "They'll be deleted for good. This can't be undone.") |
 | Lightbox Delete | Also permanent, also behind the confirmation sheet ("Delete 1 file?") |
 | Server approach | Batch actions (option 2 below) |
 | Deploy | Stop after build and test on `feature/multiselect`. Rafael reviews, merges, and restarts the service |
