@@ -4,6 +4,7 @@
 
   @media (prefers-reduced-motion: reduce) {
     * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+    .tile.sel::before, #selbar { animation: none !important; }
   }
   header { position: sticky; top: 0; z-index: 10; display: flex; flex-direction: column; gap: 6px;
            padding: calc(8px + var(--sat)) calc(16px + var(--sar)) 8px calc(16px + var(--sal)); background: #141517; border-bottom: 1px solid #2c2e33; }
@@ -73,7 +74,7 @@
      The gradient is declared on every element (not :root) so --a is re-resolved where it animates. */
   @property --a { syntax: '<angle>'; inherits: true; initial-value: 0deg; }
   @keyframes spin { to { --a: 360deg; } }
-  *, *::before, *::after { --rainbow: conic-gradient(from var(--a), #ff2d55, #ff9500, #ffd60a, #30d158, #64d2ff, #5e5ce6, #bf5af2, #ff2d55); }
+  *, *::before, *::after { --rainbow: conic-gradient(from var(--a, 0deg), #ff2d55, #ff9500, #ffd60a, #30d158, #64d2ff, #5e5ce6, #bf5af2, #ff2d55); }
   .tile, .tile img, .tile video { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
   .tile { isolation: isolate; }
   .tile img, .tile video { transition: transform .25s cubic-bezier(.2,.8,.2,1), filter .25s; }

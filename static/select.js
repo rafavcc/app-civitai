@@ -30,7 +30,9 @@ async function batch(action, items, extra = {}) {
   return { ok, failed };
 }
 
+let closeConfirm = null;
 function confirmDelete(items) {
+  closeConfirm?.(false);  // a sheet that is still open ends first, so its Esc listener doesn't leak
   return new Promise(resolve => {
     const box = $('confirm');
     $('ctitle').textContent = `Delete ${plural(items.length)}?`;
@@ -52,6 +54,7 @@ function confirmDelete(items) {
       removeEventListener('keydown', onKey, true);
       box.removeEventListener('click', onScrim);
       $('ccancel').onclick = $('cok').onclick = null;
+      closeConfirm = null;
       resolve(v);
     };
     // Capture phase so Esc closes only the sheet, not the lightbox underneath
@@ -61,6 +64,7 @@ function confirmDelete(items) {
       finish(false);
     };
     const onScrim = e => { if (e.target === box) finish(false); };
+    closeConfirm = finish;
     addEventListener('keydown', onKey, true);
     box.addEventListener('click', onScrim);
     $('ccancel').onclick = () => finish(false);
@@ -99,7 +103,7 @@ const tileItem = e => {
   const t = e.target.closest?.('.tile');
   return t ? { t, item: listed[+t.dataset.index] } : null;
 };
-let pressTimer = 0, pressTile = null, pressX = 0, pressY = 0, swallowClick = false, lastToggle = 0, lastVia = '';
+let pressTimer = 0, pressTile = null, pressX = 0, pressY = 0, swallowClick = false, gestureDone = false;
 
 function cancelPress() {
   clearTimeout(pressTimer);
@@ -108,6 +112,7 @@ function cancelPress() {
 }
 grid.addEventListener('pointerdown', e => {
   swallowClick = false;
+  gestureDone = false;
   if (Sel.active || e.button !== 0 || !e.isPrimary) return;
   const hit = tileItem(e);
   if (!hit) return;
@@ -117,6 +122,7 @@ grid.addEventListener('pointerdown', e => {
   pressTimer = setTimeout(() => {
     cancelPress();
     swallowClick = true;
+    gestureDone = true;
     Sel.toggle(hit.item);
     navigator.vibrate?.(12);
   }, 450);
@@ -126,24 +132,26 @@ grid.addEventListener('pointermove', e => {
 });
 for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) grid.addEventListener(ev, cancelPress);
 
-// One physical click can raise both click and contextmenu (Ctrl-click); toggle only once
-function tapToggle(item, via) {
-  const now = performance.now();
-  if (lastVia && lastVia !== via && now - lastToggle < 80) return;
-  lastToggle = now; lastVia = via;
+// One physical click can raise both click and contextmenu (Ctrl-click): the first one toggles,
+// the rest of the same gesture (reset on pointerdown) is ignored
+function tapToggle(item) {
+  if (gestureDone) return;
+  gestureDone = true;
   Sel.toggle(item);
 }
 grid.addEventListener('click', e => {
   const hit = tileItem(e);
   if (!hit) return;
   if (swallowClick) { swallowClick = false; return; }
-  if (Sel.active || e.metaKey || e.ctrlKey) { e.preventDefault(); tapToggle(hit.item, 'click'); }
+  if (Sel.active || e.metaKey || e.ctrlKey) { e.preventDefault(); tapToggle(hit.item); }
   else openLb(+hit.t.dataset.index);
 });
 grid.addEventListener('contextmenu', e => {
   e.preventDefault();
   const hit = tileItem(e);
-  if (hit && e.ctrlKey && !swallowClick) tapToggle(hit.item, 'ctx');
+  if (!hit || !e.ctrlKey) return;
+  cancelPress();  // otherwise the long-press timer would toggle this tile a second time
+  if (!swallowClick) tapToggle(hit.item);
 });
 grid.addEventListener('dragstart', e => { if (tileItem(e)) e.preventDefault(); });
 addEventListener('keydown', e => {

@@ -17,6 +17,14 @@ async function loadMore() {
     return;
   }
   if (g !== gen) { loading = false; return; }
+  if (listed.length > 0 && r.ver !== ver) {
+    // The folder changed under us: adopting the new ver would let the old, still-selected tiles act on
+    // whatever the new list holds at their ids. Keep the old ver (so actions get the server's 409) and stop.
+    done = true;
+    loading = false;
+    toast('Folder changed — reload to continue');
+    return;
+  }
   total = r.total;
   ver = r.ver;
   for (const it of r.items) { listed.push(it); $('grid').appendChild(tile(it, listed.length - 1)); }
