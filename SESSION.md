@@ -60,7 +60,7 @@ flowchart LR
 
 ## Known limitations / ideas
 - Item ids are indexes into the scan list, so they still shift after Rescan/folder change. The `ver` guard now stops a stale page from acting on the wrong file (409, nothing touched), but the user must reload to continue. Idea: key items by path hash.
-- Delete is permanent, no undo (and no `.trash`).
+- Delete is permanent, no undo.
 - Selection is not kept across a new listing (folder change, search, filter, sort, Rescan).
 - No authentication: anyone on the LAN can view, move and delete (a token feature was built and removed on request).
 - ffmpeg thumbnails may ignore EXIF rotation on some builds.
