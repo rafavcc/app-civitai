@@ -336,6 +336,108 @@ class Actions(GalleryTestCase):
         self.assertEqual((status, r["path"]), (200, ""))
 
 
+class Hardening(GalleryTestCase):
+    """Guards that keep a stale or foreign request from deleting the wrong file."""
+
+    def post(self, path, body):
+        return post_json(f"{self.base}{path}", body)
+
+    def id_of(self, name):
+        return next(i["id"] for i in self.items()["items"] if i["name"] == name)
+
+    def ver(self):
+        return self.items()["ver"]
+
+    def raw_post(self, path, data, headers):
+        req = urllib.request.Request(f"{self.base}{path}", data=data, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_scan_version_is_unique_per_process(self):
+        code = "import server; print(server.SCAN_VERSION)"
+        root = str(Path(__file__).resolve().parent.parent)
+        vals = [int(subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True,
+                                   text=True, check=True).stdout) for _ in range(2)]
+        for v in vals:
+            self.assertGreater(v, 10**12)
+            self.assertLess(v, 2**53)
+        self.assertNotEqual(vals[0], vals[1])
+
+    def test_folder_switch_never_pairs_new_root_with_old_items(self):
+        (self.tmp / "other" / "a.png").write_bytes(PNG * 3)  # same name as an item of the old folder
+        aid, old = self.id_of("a.png"), self.ver()
+        entered, release = threading.Event(), threading.Event()
+        real = os.scandir
+        target = str(self.tmp / "other")
+
+        def slow(path):
+            if str(path) == target:
+                entered.set()
+                release.wait(5)
+            return real(path)
+
+        server.os.scandir = slow
+        try:
+            t = threading.Thread(target=jget, args=(f"{self.base}/api/folder?path=other",))
+            t.start()
+            self.assertTrue(entered.wait(5))
+            status, _ = self.post("/api/delete", {"ids": [aid], "ver": old})
+            release.set()
+            t.join(5)
+        finally:
+            server.os.scandir = real
+            release.set()
+        self.assertIn(status, (200, 409))
+        self.assertEqual((self.tmp / "other" / "a.png").read_bytes(), PNG * 3)
+
+    def test_text_plain_body_is_415_and_touches_nothing(self):
+        body = json.dumps({"ids": [self.id_of("a.png")], "ver": self.ver()}).encode()
+        for ct in ("text/plain", "application/x-www-form-urlencoded"):
+            status, r = self.raw_post("/api/delete", body, {"Content-Type": ct})
+            self.assertEqual((status, r["error"]), (415, "Unsupported media type"), ct)
+        self.assertTrue((self.root / "a.png").exists())
+        status, _ = self.raw_post("/api/delete", body, {"Content-Type": "Application/JSON; charset=utf-8"})
+        self.assertEqual(status, 200)
+
+    def test_foreign_origin_is_403_and_same_origin_works(self):
+        body = json.dumps({"ids": [self.id_of("a.png")], "ver": self.ver()}).encode()
+        h = {"Content-Type": "application/json"}
+        status, _ = self.raw_post("/api/delete", body, {**h, "Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertTrue((self.root / "a.png").exists())
+        status, _ = self.raw_post("/api/delete", body, {**h, "Origin": self.base})
+        self.assertEqual(status, 200)
+        self.assertFalse((self.root / "a.png").exists())
+
+    def test_symlink_is_refused_and_target_survives(self):
+        os.symlink(self.root / "a.png", self.root / "link.png")
+        server.scan()
+        lid, v = self.id_of("link.png"), self.ver()
+        for path, extra in (("/api/delete", {}), ("/api/move", {"dest": "other"})):
+            status, r = self.post(path, {"ids": [lid], "ver": v, **extra})
+            self.assertEqual(status, 200)
+            self.assertEqual((r["results"][0]["ok"], r["results"][0]["error"]),
+                             (False, "Symlinks are not supported"), path)
+        self.assertTrue((self.root / "a.png").exists())
+        self.assertTrue((self.root / "link.png").is_symlink())
+
+    def test_oversize_body_closes_the_connection(self):
+        import socket
+        with socket.create_connection(self.srv.server_address, timeout=2) as s:
+            s.sendall(b"POST /api/delete HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                      b"Content-Length: 2000000\r\n\r\n")
+            data = b""
+            try:
+                while chunk := s.recv(4096):
+                    data += chunk
+            except socket.timeout:
+                self.fail("connection left open with an unread body")
+        self.assertIn(b"400", data.split(b"\r\n")[0])
+
+
 class Navigation(GalleryTestCase):
     def setUp(self):
         super().setUp()

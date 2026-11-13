@@ -36,7 +36,9 @@ BASE: Path = Path(".")  # fixed top-level folder; nothing outside it is ever ser
 ROOT: Path = Path(".")  # folder currently shown (BASE or a subfolder); only its own files are listed
 ITEMS: list[dict] = []
 LOCK = threading.Lock()
-SCAN_VERSION = 0
+# Unique per process (microseconds since the epoch, exact as a JS number): a page left open across a
+# restart must never hold a `ver` that matches the new process's list
+SCAN_VERSION = time.time_ns() // 1000
 FFMPEG = shutil.which("ffmpeg")
 THUMB_SLOTS = threading.Semaphore(4)  # bound concurrent ffmpeg processes
 log = logging.getLogger("gallery")
@@ -140,9 +142,12 @@ def rel_of(p):
     return "" if p == BASE else p.relative_to(BASE).as_posix()
 
 
-def scan():
+def scan(root=None):
+    """Indexes `root` (default: the current folder) and swaps ROOT, ITEMS and SCAN_VERSION together under LOCK."""
+    global ROOT, SCAN_VERSION
+    root = ROOT if root is None else root
     items = []
-    with os.scandir(ROOT) as it:
+    with os.scandir(root) as it:
         for e in it:
             if e.name.startswith(".") or not e.is_file():
                 continue
@@ -161,12 +166,18 @@ def scan():
                 "size": st.st_size,
             })
     items.sort(key=lambda i: i["mtime"], reverse=True)
-    global SCAN_VERSION
     with LOCK:
+        ROOT = root
         ITEMS[:] = items
         SCAN_VERSION += 1
-    log.info("Scanned %s: %d files", ROOT, len(items))
+    log.info("Scanned %s: %d files", root, len(items))
     return len(items)
+
+
+class HttpError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status, self.message = status, message
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -230,6 +241,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.delete_items(self.read_json_body())
         except (BrokenPipeError, ConnectionResetError):
             return
+        except HttpError as e:
+            return self.send_json({"error": e.message}, e.status)
         except ValueError:  # non-numeric ids and similar malformed input
             return self.send_json({"error": "bad request"}, 400)
         except Exception:
@@ -275,10 +288,19 @@ class Handler(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length", ""))
         except ValueError:
+            self.close_connection = True
             raise ValueError("Content-Length required")
         if not 0 < n <= 1_000_000:
+            self.close_connection = True  # the body is left unread, so the stream can't be reused
             raise ValueError("bad body size")
         raw = self.rfile.read(n)
+        # CSRF guard: a cross-site form/fetch can only send "simple" requests (text/plain etc.) with no
+        # preflight, so demanding JSON forces a preflight this server never approves; also refuse foreign origins
+        origin = self.headers.get("Origin")
+        if origin is not None and urlparse(origin).netloc != self.headers.get("Host", ""):
+            raise HttpError(403, "Forbidden origin")
+        if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+            raise HttpError(415, "Unsupported media type")
         try:
             body = json.loads(raw)
         except ValueError:
@@ -302,6 +324,8 @@ class Handler(BaseHTTPRequestHandler):
                         r["error"] = "File not found"
                     elif item.get("moved"):
                         r["error"] = "Already moved"
+                    elif (ROOT / item["path"]).is_symlink():
+                        r["error"] = "Symlinks are not supported"  # resolving would act on the link's target
                     else:
                         src = (ROOT / item["path"]).resolve()
                         if ROOT not in src.parents or not src.is_file():
@@ -349,11 +373,11 @@ class Handler(BaseHTTPRequestHandler):
         self.batch(body, None, one)
 
     def set_folder(self, path):
-        global ROOT
-        ROOT = Path(path)
-        save_state(folder=str(ROOT))
-        log.info("Folder changed to %s", ROOT)
-        self.send_json({"folder": str(ROOT), "path": rel_of(ROOT), "count": scan()})
+        new = Path(path)
+        count = scan(new)  # swaps ROOT/ITEMS/SCAN_VERSION atomically once the walk is done
+        save_state(folder=str(new))
+        log.info("Folder changed to %s", new)
+        self.send_json({"folder": str(new), "path": rel_of(new), "count": count})
 
     def switch_folder(self, rel):
         new = resolve_rel(rel)
