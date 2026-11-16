@@ -40,7 +40,7 @@ function confirmDelete(items) {
     stack.innerHTML = '';
     for (const it of items.slice(0, 4)) {
       const im = document.createElement('img');
-      im.src = '/thumb/' + it.id + '?v=' + ver;
+      im.src = url('thumb', it);
       stack.appendChild(im);
     }
     if (items.length > 4) {

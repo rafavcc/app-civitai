@@ -1,6 +1,8 @@
 const PAGE = 40;
 const $ = id => document.getElementById(id);
 let seed = Math.random().toString(36).slice(2), ver = 0;
+// Keyed URL: it.k comes from the server (file mtime+size), so a URL only changes when the file does
+const url = (kind, it) => `/${kind}/${it.id}?k=${it.k}`;
 let offset = 0, total = 0, loading = false, done = false, gen = 0, listed = [];
 
 async function loadMore() {
@@ -57,14 +59,13 @@ function markWide(d, w, h) {
 function tile(it, index) {
   const d = document.createElement('div');
   d.className = 'tile';
-  const src = '/media/' + it.id + '?v=' + ver;
-  const thumb = '/thumb/' + it.id + '?v=' + ver;
+  const thumb = url('thumb', it);
   if (it.kind === 'image') {
     d.innerHTML = `<img loading="lazy" decoding="async" src="${thumb}" width="${it.width || '600'}" height="${it.height || '450'}">`;
     const im = d.firstChild;
     im.onload = () => markWide(d, im.naturalWidth, im.naturalHeight);
   } else {
-    d.innerHTML = `<video muted loop playsinline preload="metadata" poster="${thumb}" data-src="${src}#t=0.1"></video>`;
+    d.innerHTML = `<video muted loop playsinline preload="metadata" poster="${thumb}" data-src="${url('preview', it)}"></video>`;
     const v = d.firstChild;
     v.autoplay = true;
     v.onloadedmetadata = () => markWide(d, v.videoWidth, v.videoHeight);
@@ -115,10 +116,21 @@ function openLb(i, dir = 1) {
     return n >= 0 && n < listed.length ? openLb(n, dir) : closeLb();
   }
   cur = i;
-  const src = '/media/' + it.id + '?v=' + ver;
-  $('lbmedia').innerHTML = it.kind === 'image' ? `<img src="${src}">` : `<video src="${src}" controls autoplay loop></video>`;
+  if (it.kind === 'image') {
+    // Show the cached thumb at once, swap in the full image when it has loaded (if still on this item)
+    $('lbmedia').innerHTML = `<img src="${url('thumb', it)}">`;
+    const im = $('lbmedia').firstChild, full = new Image(), big = url('media', it);
+    full.onload = () => { if (cur === i && $('lbmedia').firstChild === im) im.src = big; };
+    full.src = big;
+  } else {
+    $('lbmedia').innerHTML = `<video src="${url('media', it)}" controls autoplay loop muted playsinline></video>`;
+    $('lbmedia').firstChild.muted = true;
+  }
   $('lbinfo').textContent = `${it.path} · ${(it.size / 1048576).toFixed(2)} MB · ${new Date(it.mtime * 1000).toLocaleString()}`;
   $('lb').classList.add('open');
+  for (const n of [listed[i - 1], listed[i + 1]]) {
+    if (n && !n.moved) new Image().src = url(n.kind === 'image' ? 'media' : 'thumb', n);
+  }
   if (i >= listed.length - 3) loadMore();
 }
 function closeLb() { $('lb').classList.remove('open'); $('lbmedia').innerHTML = ''; cur = -1; }
@@ -219,10 +231,10 @@ $('mvbtn').onclick = () => {
   });
 };
 
-// Auto-scroll: seconds per grid row set by the speed slider (20s left, 10s middle, 2s right)
+// Auto-scroll: seconds per grid row set by the speed slider (10s left, 4.5s middle, 1.5385s right; exponential)
 function rowSeconds() {
   const v = +$('speed').value;
-  return v <= 50 ? 20 - v / 5 : 10 - (v - 50) * 0.16;
+  return v <= 50 ? 10 * 0.45 ** (v / 50) : 4.5 * (1.5385 / 4.5) ** ((v - 50) / 50);
 }
 let autoPos = 0, autoLast = 0;
 function autoStep(now) {
@@ -243,20 +255,38 @@ $('auto').onchange = () => {
   if ($('auto').checked) { autoPos = scrollY; autoLast = performance.now(); requestAnimationFrame(autoStep); }
 };
 
-// Remember sort/filter/random/speed per device (localStorage can throw in private mode, so it is optional)
+// Grid columns: 4 -> 5 -> 6 -> 4. Only the CSS variable changes, so tiles (and any selection) stay as they are.
+const COLS = [4, 5, 6];
+let cols = 4;
+function setCols(n) {
+  cols = n;
+  document.documentElement.style.setProperty('--cols', n);
+  $('cols').textContent = '▦ ' + n;
+}
+
+// Remember sort/filter/random/speed/columns per device (localStorage can throw in private mode, so it is optional)
 const PREFS = ['kind', 'sort', 'rand', 'speed'];
 function prefValue(id) { return $(id).type === 'checkbox' ? $(id).checked : $(id).value; }
+function savePrefs() {
+  try { localStorage.setItem('prefs', JSON.stringify({ ...Object.fromEntries(PREFS.map(k => [k, prefValue(k)])), cols })); } catch (e) {}
+}
 try {
   const saved = JSON.parse(localStorage.getItem('prefs') || '{}');
   for (const id of PREFS) {
     if (!(id in saved)) continue;
     if ($(id).type === 'checkbox') $(id).checked = !!saved[id]; else $(id).value = saved[id];
   }
+  if (COLS.includes(saved.cols)) setCols(saved.cols);
 } catch (e) {}
-for (const id of PREFS) {
-  $(id).addEventListener('change', () => {
-    try { localStorage.setItem('prefs', JSON.stringify(Object.fromEntries(PREFS.map(k => [k, prefValue(k)])))); } catch (e) {}
-  });
-}
+for (const id of PREFS) $(id).addEventListener('change', savePrefs);
+
+$('cols').onclick = () => {
+  // Keep the tile at the top of the viewport at the top after the rows reflow
+  const hh = document.querySelector('header').offsetHeight;
+  const first = [...$('grid').children].find(t => t.getBoundingClientRect().bottom > hh);
+  setCols(COLS[(COLS.indexOf(cols) + 1) % COLS.length]);
+  if (first) scrollTo({ top: first.getBoundingClientRect().top + scrollY - hh, behavior: 'instant' });
+  savePrefs();
+};
 
 loadMore();
