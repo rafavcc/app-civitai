@@ -4,6 +4,7 @@
 Usage: python3 server.py /path/to/media   (listens on 0.0.0.0:8765)
 """
 import argparse
+import email.utils
 import hashlib
 import json
 import logging
@@ -13,6 +14,7 @@ import random
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -26,7 +28,13 @@ VIDEO_EXT = {".mp4", ".webm", ".mov", ".m4v", ".mkv"}
 APP_DIR = Path(__file__).parent
 STATIC_DIR = APP_DIR / "static"
 STATE_FILE = APP_DIR / "state.json"
-CACHE_DIR = APP_DIR / ".cache" / "thumbs"
+# Outside the project so a sync/backup of the app folder never carries the caches along
+CACHE_ROOT = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "civit-rv"
+CACHE_DIR = CACHE_ROOT / "thumbs"
+PREVIEW_DIR = CACHE_ROOT / "previews"
+CACHE_MAX_AGE = 30 * 86400  # cached files unused for this long are swept
+TOUCH_EVERY = 86400  # refresh a file's last-use time at most this often
+SWEEP_EVERY = 86400
 HOST = "0.0.0.0"
 PORT = 8765
 THUMB_WIDTH = 512
@@ -41,6 +49,7 @@ LOCK = threading.Lock()
 SCAN_VERSION = time.time_ns() // 1000
 FFMPEG = shutil.which("ffmpeg")
 THUMB_SLOTS = threading.Semaphore(4)  # bound concurrent ffmpeg processes
+FAILED: set[str] = set()  # "kind:cache_key" whose generation failed in this process; not retried
 log = logging.getLogger("gallery")
 
 
@@ -66,17 +75,55 @@ def get_item(idx):
         return ITEMS[idx] if 0 <= idx < len(ITEMS) else None
 
 
+def file_key(item):
+    return f"{int(item['mtime'] * 1000)}-{item['size']}"
+
+
+def cache_key(item):
+    return hashlib.sha1(f"{ROOT}|{item['path']}|{item['mtime']}|{item['size']}".encode()).hexdigest()
+
+
 def thumb_path(item):
-    key = hashlib.sha1(f"{ROOT}|{item['path']}|{item['mtime']}|{item['size']}".encode()).hexdigest()
+    key = cache_key(item)
     return CACHE_DIR / key[:2] / f"{key}.jpg"
 
 
 def drop_thumb(item):
-    # A deleted file's cached thumbnail would otherwise linger forever
+    # A deleted file's cached thumbnail and preview would otherwise linger until swept
+    key = cache_key(item)
+    for p in (thumb_path(item), PREVIEW_DIR / key[:2] / f"{key}.mp4"):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def touch_used(path):
+    """Marks a cached file as used now, at most once per TOUCH_EVERY."""
     try:
-        thumb_path(item).unlink(missing_ok=True)
+        now = time.time()
+        if now - path.stat().st_mtime > TOUCH_EVERY:
+            os.utime(path, (now, now))
     except OSError:
         pass
+
+
+def sweep_cache(now=None):
+    """Deletes cached files unused for CACHE_MAX_AGE. Never follows symlinks. Returns the count."""
+    cutoff = (time.time() if now is None else now) - CACHE_MAX_AGE
+    removed = 0
+    for base in (CACHE_DIR, PREVIEW_DIR):
+        for dirpath, _dirs, files in os.walk(base, followlinks=False):
+            for name in files:
+                f = os.path.join(dirpath, name)
+                try:
+                    st = os.lstat(f)
+                    if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                        os.unlink(f)
+                        removed += 1
+                except OSError:
+                    pass
+    return removed
 
 
 def parse_ids(body):
@@ -99,6 +146,9 @@ def make_thumb(item):
     out = thumb_path(item)
     if out.is_file():
         return out
+    fail_key = f"thumb:{cache_key(item)}"
+    if fail_key in FAILED:
+        return None
     src = ROOT / item["path"]
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(f"{out.name}.{threading.get_ident()}.tmp.jpg")
@@ -116,6 +166,7 @@ def make_thumb(item):
             os.replace(tmp, out)
             return out
         except (subprocess.SubprocessError, OSError) as e:
+            FAILED.add(fail_key)
             log.warning("Thumbnail failed for %s: %s", item["path"], getattr(e, "stderr", e))
             return None
         finally:
@@ -220,9 +271,9 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/rescan":
                 return self.send_json({"count": scan()})
             if url.path.startswith("/media/"):
-                return self.media(int(url.path[7:]))
+                return self.media(int(url.path[7:]), q)
             if url.path.startswith("/thumb/"):
-                return self.thumb(int(url.path[7:]))
+                return self.thumb(int(url.path[7:]), q)
         except (BrokenPipeError, ConnectionResetError):
             return
         except ValueError:  # non-numeric ids and similar malformed input
@@ -411,36 +462,52 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({
             "total": len(indexed),
             "ver": ver,
-            "items": [{"id": i, **it} for i, it in page],
+            "items": [{"id": i, **it, "k": file_key(it)} for i, it in page],
         })
 
-    def media(self, idx):
+    def media(self, idx, q):
         item = get_item(idx)
         if item is None or item.get("moved"):
             return self.send_json({"error": "not found"}, 404)
         full = (ROOT / item["path"]).resolve()
         if ROOT not in full.parents:
             return self.send_json({"error": "forbidden"}, 403)
-        self.send_file(full, cache=True)
+        self.send_file(full, immutable=q.get("k", [""])[0] == file_key(item))
 
-    def thumb(self, idx):
+    def thumb(self, idx, q):
         item = get_item(idx)
         if item is None or item.get("moved"):
             return self.send_json({"error": "not found"}, 404)
         full = (ROOT / item["path"]).resolve()
         if ROOT not in full.parents:
             return self.send_json({"error": "forbidden"}, 403)
+        keyed = q.get("k", [""])[0] == file_key(item)
         t = make_thumb(item)
         if t:
-            return self.send_file(t, cache=True)
+            touch_used(t)
+            return self.send_file(t, immutable=keyed)
         if item["kind"] == "image":  # no ffmpeg or it failed: the original still works
-            return self.send_file(full, cache=True)
+            return self.send_file(full, immutable=keyed)
         self.send_json({"error": "no thumbnail"}, 404)
 
-    def send_file(self, path: Path, cache=False):
+    def send_file(self, path: Path, cache=False, immutable=False):
         if not path.is_file():
             return self.send_json({"error": "not found"}, 404)
-        size = path.stat().st_size
+        st = path.stat()
+        size = st.st_size
+        last_mod = email.utils.formatdate(int(st.st_mtime), usegmt=True)
+        ims = self.headers.get("If-Modified-Since")
+        if ims and not self.headers.get("Range"):
+            try:
+                if email.utils.parsedate_to_datetime(ims).timestamp() >= int(st.st_mtime):
+                    self.send_response(304)
+                    self.send_header("Last-Modified", last_mod)
+                    self.send_header("Cache-Control", cache_control(cache, immutable))
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+            except (TypeError, ValueError):
+                pass
         ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         start, end = 0, size - 1
         status = 200
@@ -464,7 +531,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
-        self.send_header("Cache-Control", "public, max-age=3600" if cache else "no-cache")
+        self.send_header("Last-Modified", last_mod)
+        self.send_header("Cache-Control", cache_control(cache, immutable))
         if status == 206:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
@@ -477,6 +545,18 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
+
+
+def cache_control(cache, immutable):
+    if immutable:
+        return "public, max-age=31536000, immutable"
+    return "public, max-age=3600" if cache else "no-cache"
+
+
+def sweep_loop():
+    while True:
+        time.sleep(SWEEP_EVERY)
+        log.info("Cache sweep removed %d stale files", sweep_cache())
 
 
 def display_host(host):
@@ -523,6 +603,8 @@ def main():
     t = time.perf_counter()
     n = scan()
     log.info("Indexed %d files in %.1fs", n, time.perf_counter() - t)
+    log.info("Cache sweep removed %d stale files", sweep_cache())
+    threading.Thread(target=sweep_loop, daemon=True).start()
     log.info("Open http://%s:%d", display_host(HOST), PORT)
     Server((HOST, PORT), Handler).serve_forever()
 

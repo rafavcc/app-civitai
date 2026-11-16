@@ -1,3 +1,4 @@
+import email.utils
 import json
 import os
 import shutil
@@ -5,7 +6,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -66,16 +69,18 @@ class GalleryTestCase(unittest.TestCase):
         server.BASE = self.tmp
         server.ROOT = self.root
         # Keep tests away from the real state file and thumbnail cache
-        self._saved = (server.STATE_FILE, server.CACHE_DIR, server.FFMPEG)
+        self._saved = (server.STATE_FILE, server.CACHE_DIR, server.PREVIEW_DIR, server.FFMPEG)
         server.STATE_FILE = self.tmp / "state.json"
         server.CACHE_DIR = self.tmp / "cache"
+        server.PREVIEW_DIR = self.tmp / "previews"
+        server.FAILED.clear()
         server.scan()
         self.srv, self.base = start()
 
     def tearDown(self):
         self.srv.shutdown()
         self.srv.server_close()
-        server.STATE_FILE, server.CACHE_DIR, server.FFMPEG = self._saved
+        server.STATE_FILE, server.CACHE_DIR, server.PREVIEW_DIR, server.FFMPEG = self._saved
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def items(self, **params):
@@ -185,6 +190,106 @@ class MediaServing(GalleryTestCase):
         status, body, h = get(f"{self.base}/thumb/{self.first_id('real.mp4')}")
         self.assertEqual((status, h["Content-Type"]), (200, "image/jpeg"))
         self.assertTrue(body.startswith(b"\xff\xd8"))
+
+
+CACHE_ROOT_DEFAULT = server.CACHE_ROOT
+
+
+class Caching(GalleryTestCase):
+    def item(self, name):
+        return next(i for i in self.items()["items"] if i["name"] == name)
+
+    def test_items_carry_key(self):
+        for it in self.items()["items"]:
+            self.assertEqual(it["k"], server.file_key(it))
+
+    def test_keyed_media_is_immutable(self):
+        it = self.item("a.png")
+        _, _, h = get(f"{self.base}/media/{it['id']}?k={it['k']}")
+        self.assertIn("immutable", h["Cache-Control"])
+        self.assertIn("max-age=31536000", h["Cache-Control"])
+
+    def test_unkeyed_or_stale_key_is_not_immutable(self):
+        it = self.item("a.png")
+        for qs in ("", "?k=1-1"):
+            _, _, h = get(f"{self.base}/media/{it['id']}{qs}")
+            self.assertEqual(h["Cache-Control"], "no-cache")
+            self.assertNotIn("immutable", h["Cache-Control"])
+
+    def test_last_modified_and_304(self):
+        it = self.item("a.png")
+        url = f"{self.base}/media/{it['id']}"
+        _, _, h = get(url)
+        lm = h["Last-Modified"]
+        self.assertTrue(lm)
+        status, body, _ = get(url, headers={"If-Modified-Since": lm})
+        self.assertEqual((status, body), (304, b""))
+        older = email.utils.formatdate(os.stat(self.root / "a.png").st_mtime - 3600, usegmt=True)
+        status, _, _ = get(url, headers={"If-Modified-Since": older})
+        self.assertEqual(status, 200)
+
+    def test_range_request_ignores_if_modified_since(self):
+        it = self.item("a.png")
+        url = f"{self.base}/media/{it['id']}"
+        _, _, h = get(url)
+        status, _, _ = get(url, headers={"Range": "bytes=0-3", "If-Modified-Since": h["Last-Modified"]})
+        self.assertEqual(status, 206)
+
+    def test_touch_used_refreshes_only_old_files(self):
+        old, recent = self.tmp / "old", self.tmp / "recent"
+        for f in (old, recent):
+            f.write_bytes(b"x")
+        now = time.time()
+        os.utime(old, (now - 2 * 86400, now - 2 * 86400))
+        os.utime(recent, (now - 3600, now - 3600))
+        server.touch_used(old)
+        server.touch_used(recent)
+        self.assertLess(abs(old.stat().st_mtime - now), 60)
+        self.assertAlmostEqual(recent.stat().st_mtime, now - 3600, delta=1)
+
+    def test_sweep_deletes_only_stale_files_in_cache(self):
+        now = time.time()
+        stale = now - 31 * 86400
+        outside = self.tmp / "outside.bin"
+        outside.write_bytes(b"x")
+        os.utime(outside, (stale, stale))
+        made = {}
+        for d in (server.CACHE_DIR, server.PREVIEW_DIR):
+            (d / "ab").mkdir(parents=True)
+            old, fresh = d / "ab" / "old", d / "ab" / "fresh"
+            old.write_bytes(b"x")
+            fresh.write_bytes(b"x")
+            os.utime(old, (stale, stale))
+            made[d] = (old, fresh)
+        link = server.PREVIEW_DIR / "ab" / "link"
+        link.symlink_to(outside)
+        self.assertEqual(server.sweep_cache(), 2)
+        for old, fresh in made.values():
+            self.assertFalse(old.exists())
+            self.assertTrue(fresh.exists())
+        self.assertTrue(outside.exists())
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_failed_thumb_not_retried(self):
+        server.FFMPEG = shutil.which("ffmpeg")
+        (self.root / "bad.webp").write_bytes(b"not an image")
+        server.scan()
+        it = self.item("bad.webp")
+        real, calls = subprocess.run, []
+
+        def counting(*a, **kw):
+            calls.append(a)
+            return real(*a, **kw)
+
+        with mock.patch.object(server.subprocess, "run", counting):
+            for _ in range(2):
+                status, body, _ = get(f"{self.base}/thumb/{it['id']}")
+                self.assertEqual((status, body), (200, b"not an image"))
+        self.assertEqual(len(calls), 1)
+
+    def test_cache_root_is_outside_project(self):
+        self.assertEqual(CACHE_ROOT_DEFAULT.name, "civit-rv")
+        self.assertNotIn(server.APP_DIR.resolve(), CACHE_ROOT_DEFAULT.resolve().parents)
 
 
 class Actions(GalleryTestCase):
