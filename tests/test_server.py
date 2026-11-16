@@ -18,6 +18,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import server  # noqa: E402
 
+# Redirect every on-disk path for the whole run, so even a background warm
+# thread that outlives a test's tearDown can never reach the real cache,
+# the real state file or the project's old thumbs folder.
+_RUN_TMP = Path(tempfile.mkdtemp(prefix="civit-tests-"))
+server.CACHE_DIR = _RUN_TMP / "thumbs"
+server.PREVIEW_DIR = _RUN_TMP / "previews"
+server.STATE_FILE = _RUN_TMP / "state.json"
+server.LEGACY_THUMBS = _RUN_TMP / "legacy-thumbs"
+import atexit  # noqa: E402
+atexit.register(shutil.rmtree, _RUN_TMP, ignore_errors=True)
+
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
     "1f15c4890000000d49444154789c6360000002000001e221bc330000000049454e44ae426082")
