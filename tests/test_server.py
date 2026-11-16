@@ -457,6 +457,7 @@ class OnlineOnly(GalleryTestCase):
         def fake_read(path):
             self.started.append(Path(path).name)
             self.gate.wait(10)
+            self.online.discard(Path(path).name)  # the placeholder is now a real file
 
         self.patches = [mock.patch.object(server, "is_online_only", lambda p: Path(p).name in self.online),
                         mock.patch.object(server, "_read_fully", fake_read)]
@@ -557,6 +558,40 @@ class OnlineOnly(GalleryTestCase):
         deadline = time.time() + 5
         while server._FETCHING and time.time() < deadline:
             time.sleep(0.01)
+        self.assertEqual(server._FETCHING, {})
+
+    def test_failed_fetch_is_503_not_ffmpeg_on_the_placeholder(self):
+        it = self.item("a.png")
+        with mock.patch.object(server, "_read_fully", side_effect=OSError("offline")), \
+                self.assertLogs("gallery", "WARNING"), self.no_ffmpeg_calls():
+            status, body, h = get(f"{self.base}/thumb/{it['id']}")
+        self.assertEqual((status, h["Retry-After"], h["Cache-Control"]), (503, "10", "no-store"))
+        self.assertEqual(server.FAILED, set())
+
+    def test_still_online_only_after_read_is_503(self):
+        it = self.item("clip.mp4")
+        with mock.patch.object(server, "_read_fully", lambda path: None), self.no_ffmpeg_calls():
+            status, _, h = get(f"{self.base}/preview/{it['id']}")
+        self.assertEqual((status, h["Retry-After"]), (503, "10"))
+
+    def test_no_thumbnail_after_fetch_if_folder_changed(self):
+        def read_then_switch(path):
+            with server.LOCK:
+                server.SCAN_VERSION += 1
+        with mock.patch.object(server, "_read_fully", read_then_switch), \
+                mock.patch.object(server, "make_thumb") as mt:
+            ev = server.fetch(self.root / "a.png")
+            self.assertTrue(ev.wait(5))
+            deadline = time.time() + 5
+            while server._FETCHING and time.time() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.2)
+        mt.assert_not_called()
+
+    def test_thread_start_failure_releases_entry(self):
+        with mock.patch.object(server.threading.Thread, "start", side_effect=RuntimeError("no threads")):
+            with self.assertRaises(RuntimeError):
+                server.fetch(self.root / "a.png")
         self.assertEqual(server._FETCHING, {})
 
 

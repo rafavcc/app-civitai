@@ -206,7 +206,7 @@ def _read_fully(path):
             pass
 
 
-def _fetch_worker(path, key, event):
+def _fetch_worker(path, key, event, root, version):
     try:
         with FETCH_SLOTS:
             _read_fully(path)
@@ -220,11 +220,12 @@ def _fetch_worker(path, key, event):
             _FETCHING.pop(key, None)
     if ok:
         try:
-            with LOCK:
-                items = list(ITEMS)
+            with LOCK:  # same pattern as warm(): only act if the folder is still the one fetch() saw
+                items = list(ITEMS) if SCAN_VERSION == version else []
             for item in items:
-                if not item.get("moved") and str(ROOT / item["path"]) == key:
-                    make_thumb(item)
+                if not item.get("moved") and str(root / item["path"]) == key:
+                    if SCAN_VERSION == version:
+                        make_thumb(item)
                     break
         except Exception:
             log.exception("Thumbnail after download failed for %s", path)
@@ -233,11 +234,18 @@ def _fetch_worker(path, key, event):
 def fetch(path):
     """Starts (once per path) a background read of an online-only file; returns an Event set when it ends."""
     key = str(path)
+    with LOCK:
+        root, version = ROOT, SCAN_VERSION
     with _FETCH_LOCK:
         event = _FETCHING.get(key)
         if event is None:
             event = _FETCHING[key] = threading.Event()
-            threading.Thread(target=_fetch_worker, args=(path, key, event), daemon=True).start()
+            try:
+                threading.Thread(target=_fetch_worker, args=(path, key, event, root, version), daemon=True).start()
+            except BaseException:
+                del _FETCHING[key]
+                event.set()
+                raise
     return event
 
 
@@ -757,7 +765,8 @@ class Handler(BaseHTTPRequestHandler):
     def still_downloading(self, full):
         """For an online-only file: starts its download and waits up to FETCH_WAIT. If it is not there yet,
         answers 503 (the download keeps going) and returns True."""
-        if is_online_only(full) and not fetch(full).wait(FETCH_WAIT):
+        # a finished fetch is not enough: it may have failed or the file been evicted again
+        if is_online_only(full) and not (fetch(full).wait(FETCH_WAIT) and not is_online_only(full)):
             self.send_json({"error": "downloading"}, 503, no_store=True, headers={"Retry-After": "10"})
             return True
         return False
