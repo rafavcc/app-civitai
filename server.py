@@ -104,6 +104,21 @@ def drop_thumb(item):
             pass
 
 
+def validate_name(stem, suffix):
+    """Returns the full new file name for a rename, or raises HttpError(400) with the reason."""
+    stem = stem.strip()
+    if not stem:
+        raise HttpError(400, "Name can't be empty")
+    if re.search(r'[/\\:*?"<>|\x00-\x1f]', stem):
+        raise HttpError(400, 'Name can\'t contain / \\ : * ? " < > |')
+    if stem.startswith("."):
+        raise HttpError(400, "Name can't start with a dot")
+    name = stem + suffix
+    if len(name.encode("utf-8", "surrogatepass")) > 255:
+        raise HttpError(400, "Name is too long")
+    return name
+
+
 def touch_used(path):
     """Marks a cached file as used now, at most once per TOUCH_EVERY."""
     try:
@@ -352,6 +367,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.move_items(self.read_json_body())
             if url.path == "/api/delete":
                 return self.delete_items(self.read_json_body())
+            if url.path == "/api/rename":
+                return self.rename_item(self.read_json_body())
         except (BrokenPipeError, ConnectionResetError):
             return
         except HttpError as e:
@@ -484,6 +501,49 @@ class Handler(BaseHTTPRequestHandler):
             log.info("Deleted %s", src)
 
         self.batch(body, None, one)
+
+    def rename_item(self, body):
+        idx, ver, stem = body.get("id"), body.get("ver"), body.get("name")
+        if any(not isinstance(v, int) or isinstance(v, bool) for v in (idx, ver)) or not isinstance(stem, str):
+            raise HttpError(400, "id and ver must be integers and name a string")
+        with LOCK:
+            if ver != SCAN_VERSION:
+                return self.send_json({"error": "Folder changed — reload to continue"}, 409)
+            item = ITEMS[idx] if 0 <= idx < len(ITEMS) else None
+            if item is None or item.get("moved"):
+                return self.send_json({"error": "File not found"}, 404)
+            link = ROOT / item["path"]
+            if link.is_symlink():
+                return self.send_json({"error": "Symlinks are not supported"}, 400)
+            src = link.resolve()
+            if ROOT not in src.parents or not src.is_file():
+                return self.send_json({"error": "File not found"}, 404)
+            new_name = validate_name(stem, Path(item["name"]).suffix)
+            if new_name == item["name"]:
+                return self.send_json({"ok": True, "id": idx, "name": item["name"], "path": item["path"]})
+            with os.scandir(src.parent) as it:
+                for entry in it:
+                    if entry.name != item["name"] and entry.name.casefold() == new_name.casefold():
+                        raise HttpError(400, f"A file named {new_name} already exists")
+            target = src.parent / new_name
+            old_cache = (thumb_path(item), preview_path(item))
+            try:
+                os.rename(src, target)
+            except OSError as e:
+                log.warning("Rename failed for %s: %s", item["path"], e)
+                raise HttpError(400, f"Could not rename file: {e.strerror or e}")
+            old_path = item["path"]
+            item["name"] = new_name
+            item["path"] = target.relative_to(ROOT).as_posix()
+            for old, new in zip(old_cache, (thumb_path(item), preview_path(item))):
+                try:
+                    new.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(old, new)
+                except OSError:
+                    pass
+            result = {"ok": True, "id": idx, "name": item["name"], "path": item["path"]}
+        log.info("Renamed %s -> %s", old_path, result["path"])
+        self.send_json(result)
 
     def set_folder(self, path):
         new = Path(path)

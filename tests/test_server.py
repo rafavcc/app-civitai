@@ -567,6 +567,122 @@ class Actions(GalleryTestCase):
         self.assertEqual((status, r["path"]), (200, ""))
 
 
+class Rename(GalleryTestCase):
+    def post(self, body):
+        return post_json(f"{self.base}/api/rename", body)
+
+    def id_of(self, name):
+        return next(i["id"] for i in self.items()["items"] if i["name"] == name)
+
+    def ver(self):
+        return self.items()["ver"]
+
+    def rename(self, old, name):
+        return self.post({"id": self.id_of(old), "ver": self.ver(), "name": name})
+
+    def test_rename_keeps_extension_and_id(self):
+        aid = self.id_of("a.png")
+        status, r = self.post({"id": aid, "ver": self.ver(), "name": "new"})
+        self.assertEqual((status, r["ok"], r["id"], r["name"], r["path"]), (200, True, aid, "new.png", "new.png"))
+        self.assertFalse((self.root / "a.png").exists())
+        self.assertEqual((self.root / "new.png").read_bytes(), PNG)
+        it = next(i for i in self.items()["items"] if i["id"] == aid)
+        self.assertEqual(it["path"], "new.png")
+        status, body, _ = get(f"{self.base}/media/{aid}")
+        self.assertEqual((status, body), (200, PNG))
+
+    def test_conflict_is_case_insensitive(self):
+        status, r = self.rename("a.png", "BB")
+        self.assertEqual((status, r["error"]), (400, "A file named BB.png already exists"))
+        self.assertTrue((self.root / "a.png").exists())
+        self.assertTrue((self.root / "bb.png").exists())
+
+    def test_conflict_with_non_media_entries(self):
+        (self.root / "x.png").mkdir()
+        status, r = self.rename("a.png", "X")
+        self.assertEqual((status, r["error"]), (400, "A file named X.png already exists"))
+        self.assertTrue((self.root / "a.png").exists())
+        status, r = self.rename("a.png", ".hidden")
+        self.assertEqual((status, r["error"]), (400, "Name can't start with a dot"))
+
+    def test_case_only_change_allowed(self):
+        status, r = self.rename("a.png", "A")
+        self.assertEqual((status, r["name"]), (200, "A.png"))
+        self.assertIn("A.png", os.listdir(self.root))
+        self.assertNotIn("a.png", os.listdir(self.root))
+
+    def test_same_name_is_noop(self):
+        status, r = self.rename("a.png", "a")
+        self.assertEqual((status, r["name"]), (200, "a.png"))
+        self.assertEqual((self.root / "a.png").stat().st_mtime, 1000)
+
+    def test_invalid_names(self):
+        bad = "Name can't contain / \\ : * ? \" < > |"
+        cases = [("", "Name can't be empty"), ("   ", "Name can't be empty"),
+                 ("a/b", bad), ("a:b", bad), ("a\x01", bad), ("x" * 256, "Name is too long")]
+        for name, msg in cases:
+            status, r = self.rename("a.png", name)
+            self.assertEqual((status, r["error"]), (400, msg), repr(name))
+        self.assertTrue((self.root / "a.png").exists())
+
+    def test_bad_body_shape_is_400(self):
+        v = self.ver()
+        for body in ({"ver": v, "name": "n"}, {"id": "1", "ver": v, "name": "n"},
+                     {"id": 0, "name": "n"}, {"id": 0, "ver": v, "name": 5}, {"id": 0, "ver": v}):
+            self.assertEqual(self.post(body)[0], 400, body)
+
+    def test_stale_ver_409(self):
+        aid = self.id_of("a.png")
+        status, r = self.post({"id": aid, "ver": self.ver() - 1, "name": "new"})
+        self.assertEqual((status, r["error"]), (409, "Folder changed \u2014 reload to continue"))
+        self.assertTrue((self.root / "a.png").exists())
+
+    def test_requires_json_and_same_origin(self):
+        body = json.dumps({"id": self.id_of("a.png"), "ver": self.ver(), "name": "new"}).encode()
+        for headers, want in (({"Content-Type": "text/plain"}, 415),
+                              ({"Content-Type": "application/json", "Origin": "http://evil.example"}, 403)):
+            req = urllib.request.Request(f"{self.base}/api/rename", data=body, method="POST", headers=headers)
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(req)
+            self.assertEqual(cm.exception.code, want)
+            cm.exception.close()
+        self.assertTrue((self.root / "a.png").exists())
+
+    def test_moved_item_404(self):
+        aid = self.id_of("a.png")
+        status, _ = post_json(f"{self.base}/api/move", {"ids": [aid], "ver": self.ver(), "dest": "other"})
+        self.assertEqual(status, 200)
+        status, r = self.post({"id": aid, "ver": self.ver(), "name": "new"})
+        self.assertEqual((status, r["error"]), (404, "File not found"))
+
+    def test_symlink_refused(self):
+        (self.root / "link.png").symlink_to(self.root / "a.png")
+        server.scan()
+        status, r = self.rename("link.png", "other")
+        self.assertEqual((status, r["error"]), (400, "Symlinks are not supported"))
+        self.assertTrue((self.root / "link.png").is_symlink())
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_cached_thumb_follows_rename(self):
+        server.FFMPEG = shutil.which("ffmpeg")
+        img = self.tmp / "big.jpg"
+        subprocess.run([server.FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=red:s=1600x900",
+                        "-frames:v", "1", str(img)], check=True)
+        shutil.copy(img, self.root / "big.jpg")
+        server.scan()
+        tid = self.id_of("big.jpg")
+        get(f"{self.base}/thumb/{tid}")
+        old = server.thumb_path(server.ITEMS[tid])
+        self.assertTrue(old.exists())
+        status, _ = self.post({"id": tid, "ver": self.ver(), "name": "renamed"})
+        self.assertEqual(status, 200)
+        self.assertFalse(old.exists())
+        self.assertTrue(server.thumb_path(server.ITEMS[tid]).exists())
+        with mock.patch.object(server.subprocess, "run", side_effect=AssertionError("ffmpeg re-run")):
+            status, _, _ = get(f"{self.base}/thumb/{tid}")
+        self.assertEqual(status, 200)
+
+
 class Hardening(GalleryTestCase):
     """Guards that keep a stale or foreign request from deleting the wrong file."""
 
