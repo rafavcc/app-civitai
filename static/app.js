@@ -243,7 +243,7 @@ function autoStep(now) {
   requestAnimationFrame(autoStep);
   const dt = Math.min(now - autoLast, 100) / 1000;
   autoLast = now;
-  if (cur >= 0 || Sel.active || $('mv').classList.contains('open')) { autoPos = scrollY; return; }
+  if (cur >= 0 || Sel.active || $('mv').classList.contains('open') || $('reportsheet').classList.contains('open')) { autoPos = scrollY; return; }
   // Re-sync when the user scrolled manually or the page was reset
   if (Math.abs(scrollY - autoPos) > 2) autoPos = scrollY;
   const tile = $('grid').firstElementChild;

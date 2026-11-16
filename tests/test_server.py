@@ -1,4 +1,6 @@
+import contextlib
 import email.utils
+import errno
 import json
 import os
 import shutil
@@ -82,6 +84,8 @@ class GalleryTestCase(unittest.TestCase):
     def tearDown(self):
         self.srv.shutdown()
         self.srv.server_close()
+        with server.LOCK:
+            server.SCAN_VERSION += 1  # stops any lingering warm thread before the real cache paths return
         server.STATE_FILE, server.CACHE_DIR, server.PREVIEW_DIR, server.FFMPEG, server.WARM, server.LEGACY_THUMBS = self._saved
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -211,12 +215,25 @@ class Caching(GalleryTestCase):
         self.assertIn("immutable", h["Cache-Control"])
         self.assertIn("max-age=31536000", h["Cache-Control"])
 
-    def test_unkeyed_or_stale_key_is_not_immutable(self):
+    def test_unkeyed_is_no_cache_and_stale_key_is_404_no_store(self):
         it = self.item("a.png")
-        for qs in ("", "?k=1-1"):
-            _, _, h = get(f"{self.base}/media/{it['id']}{qs}")
-            self.assertEqual(h["Cache-Control"], "no-cache")
-            self.assertNotIn("immutable", h["Cache-Control"])
+        status, _, h = get(f"{self.base}/media/{it['id']}")
+        self.assertEqual((status, h["Cache-Control"]), (200, "no-cache"))
+        status, body, h = get(f"{self.base}/media/{it['id']}?k=1-1")
+        self.assertEqual((status, h["Cache-Control"]), (404, "no-store"))
+        self.assertNotEqual(body, PNG)
+
+    def test_stale_key_never_gets_304_or_immutable(self):
+        # Ids are list positions: after a rescan a stale page's id may point at another file.
+        for kind in ("media", "thumb", "preview"):
+            it = self.item("clip.mp4" if kind == "preview" else "a.png")
+            url = f"{self.base}/{kind}/{it['id']}?k=1-1"
+            lm = email.utils.formatdate(os.stat(self.root / it["name"]).st_mtime, usegmt=True)
+            for hdrs in ({}, {"If-Modified-Since": lm}):
+                status, body, h = get(url, headers=hdrs)
+                self.assertEqual((status, h["Cache-Control"]), (404, "no-store"), (kind, hdrs))
+                self.assertNotIn("immutable", h["Cache-Control"])
+                self.assertNotEqual(body, PNG)
 
     def test_last_modified_and_304(self):
         it = self.item("a.png")
@@ -679,6 +696,55 @@ class Rename(GalleryTestCase):
         self.assertEqual((status, r["name"]), (200, "A.png"))
         self.assertIn("A.png", os.listdir(self.root))
         self.assertNotIn("a.png", os.listdir(self.root))
+
+    def test_file_appearing_before_rename_is_not_overwritten(self):
+        real = os.scandir
+
+        def racy(path):
+            entries = list(real(path))
+            (self.root / "new.png").write_bytes(b"INTRUDER")  # created after the conflict check's listing
+            return contextlib.nullcontext(iter(entries))
+
+        aid, v = self.id_of("a.png"), self.ver()
+        with mock.patch("server.os.scandir", racy):
+            status, r = self.post({"id": aid, "ver": v, "name": "new"})
+        self.assertEqual((status, r["error"]), (400, "A file named new.png already exists"))
+        self.assertEqual((self.root / "new.png").read_bytes(), b"INTRUDER")
+        self.assertEqual((self.root / "a.png").read_bytes(), PNG)
+
+    def test_generic_oserror_is_400(self):
+        with mock.patch("server.os.link", side_effect=OSError(errno.EIO, "Input/output error")):
+            with self.assertLogs("gallery", level="WARNING"):
+                status, r = self.rename("a.png", "n")
+        self.assertEqual(status, 400)
+        self.assertTrue(r["error"].startswith("Could not rename file"))
+        self.assertTrue((self.root / "a.png").exists())
+        self.assertFalse((self.root / "n.png").exists())
+
+    def test_link_unsupported_falls_back_to_rename(self):
+        with mock.patch("server.os.link", side_effect=PermissionError(errno.EPERM, "nope")):
+            status, r = self.rename("a.png", "n")
+            self.assertEqual((status, r["name"]), (200, "n.png"))
+            (self.root / "bb.png").rename(self.root / "keep.png")  # fallback still refuses an existing target
+            status, r = self.rename("n.png", "keep")
+        self.assertEqual((status, r["error"]), (400, "A file named keep.png already exists"))
+        self.assertTrue((self.root / "n.png").exists())
+
+    def test_unlink_failure_leaves_a_single_name(self):
+        real = os.unlink
+        src = str(self.root / "a.png")
+
+        def flaky(p, *a, **k):
+            if str(p) == src:
+                raise OSError(errno.EACCES, "Permission denied")
+            return real(p, *a, **k)
+
+        with mock.patch("server.os.unlink", flaky):
+            with self.assertLogs("gallery", level="WARNING"):
+                status, r = self.rename("a.png", "n")
+        self.assertEqual(status, 400)
+        self.assertTrue((self.root / "a.png").exists())
+        self.assertFalse((self.root / "n.png").exists())
 
     def test_same_name_is_noop(self):
         status, r = self.rename("a.png", "a")

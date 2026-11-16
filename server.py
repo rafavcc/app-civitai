@@ -5,6 +5,7 @@ Usage: python3 server.py /path/to/media   (listens on 0.0.0.0:8765)
 """
 import argparse
 import email.utils
+import errno
 import hashlib
 import json
 import logging
@@ -55,6 +56,7 @@ PREVIEW_SLOTS = threading.Semaphore(2)  # clip encodes are heavy; keep them few
 WARM = True  # pre-generate thumbnails and clips in the background after a scan
 FAILED: set[str] = set()  # "kind:cache_key" whose generation failed in this process; not retried
 log = logging.getLogger("gallery")
+LINK_UNSUPPORTED = {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EMLINK}
 
 
 def load_state():
@@ -205,6 +207,8 @@ def make_thumb(item):
     with THUMB_SLOTS:
         if out.is_file():  # another request finished it while we waited
             return out
+        if fail_key in FAILED:
+            return None
         try:
             subprocess.run(cmd, check=True, timeout=60, stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -218,8 +222,9 @@ def make_thumb(item):
             tmp.unlink(missing_ok=True)
 
 
-def make_preview(item):
-    """Returns the cached 6 s silent preview clip path (encoding it if needed), or None on failure."""
+def make_preview(item, wait=True):
+    """Returns the cached 6 s silent preview clip path (encoding it if needed), or None on failure.
+    With wait=False it gives up (None) instead of queueing when both encode slots are busy."""
     if not FFMPEG:
         return None
     out = preview_path(item)
@@ -234,7 +239,9 @@ def make_preview(item):
     cmd = [FFMPEG, "-v", "error", "-y", "-ss", "0.1", "-i", str(src), "-t", "6", "-an",
            "-vf", "fps=24,scale='min(480,iw)':-2", "-c:v", "libx264", "-preset", "veryfast",
            "-crf", "30", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(tmp)]
-    with PREVIEW_SLOTS:
+    if not PREVIEW_SLOTS.acquire(blocking=wait):
+        return None
+    try:
         if out.is_file():  # another request finished it while we waited
             return out
         if fail_key in FAILED:
@@ -250,6 +257,8 @@ def make_preview(item):
             return None
         finally:
             tmp.unlink(missing_ok=True)
+    finally:
+        PREVIEW_SLOTS.release()
 
 
 def warm(version):
@@ -264,7 +273,7 @@ def warm(version):
         try:
             make_thumb(item)
             if item["kind"] == "video" and SCAN_VERSION == version:
-                make_preview(item)
+                make_preview(item, wait=False)  # never queue ahead of on-demand clip requests
         except Exception:
             log.exception("Warm-up failed for %s", item.get("path"))
 
@@ -338,10 +347,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self.path.startswith("/media/"):
             log.info("%s %s", self.address_string(), fmt % args)
 
-    def send_json(self, obj, status=200):
+    def send_json(self, obj, status=200, no_store=False):
         body = json.dumps(obj).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        if no_store:
+            self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -553,8 +564,30 @@ class Handler(BaseHTTPRequestHandler):
                         raise HttpError(400, f"A file named {new_name} already exists")
             target = src.parent / new_name
             old_cache = (thumb_path(item), preview_path(item))
+            exists = HttpError(400, f"A file named {new_name} already exists")
             try:
-                os.rename(src, target)
+                if new_name.casefold() == item["name"].casefold():
+                    os.rename(src, target)  # case-only change: the "target" is the file itself
+                else:
+                    # os.rename would silently replace a file created since the check above; os.link refuses
+                    try:
+                        os.link(src, target)
+                    except FileExistsError:
+                        raise exists
+                    except OSError as e:
+                        if e.errno not in LINK_UNSUPPORTED:
+                            raise
+                        if os.path.lexists(target):
+                            raise exists
+                        os.rename(src, target)
+                    else:
+                        try:
+                            os.unlink(src)
+                        except OSError:
+                            os.unlink(target)  # never leave two names for one file
+                            raise
+            except HttpError:
+                raise
             except OSError as e:
                 log.warning("Rename failed for %s: %s", item["path"], e)
                 raise HttpError(400, f"Could not rename file: {e.strerror or e}")
@@ -637,6 +670,14 @@ class Handler(BaseHTTPRequestHandler):
             "items": [{"id": i, **it, "k": file_key(it)} for i, it in page],
         })
 
+    def stale_key(self, item, q):
+        """Ids are list positions that change on rescan, so a `k` that is not this item's key belongs to another
+        file: answer 404 no-store (never its bytes, which a cache could pin) and return True."""
+        if "k" in q and q["k"][0] != file_key(item):
+            self.send_json({"error": "stale"}, 404, no_store=True)
+            return True
+        return False
+
     def media(self, idx, q):
         item = get_item(idx)
         if item is None or item.get("moved"):
@@ -644,7 +685,9 @@ class Handler(BaseHTTPRequestHandler):
         full = (ROOT / item["path"]).resolve()
         if ROOT not in full.parents:
             return self.send_json({"error": "forbidden"}, 403)
-        self.send_file(full, immutable=q.get("k", [""])[0] == file_key(item))
+        if self.stale_key(item, q):
+            return
+        self.send_file(full, immutable="k" in q)
 
     def thumb(self, idx, q):
         item = get_item(idx)
@@ -653,7 +696,9 @@ class Handler(BaseHTTPRequestHandler):
         full = (ROOT / item["path"]).resolve()
         if ROOT not in full.parents:
             return self.send_json({"error": "forbidden"}, 403)
-        keyed = q.get("k", [""])[0] == file_key(item)
+        if self.stale_key(item, q):
+            return
+        keyed = "k" in q
         t = make_thumb(item)
         if t:
             touch_used(t)
@@ -669,7 +714,9 @@ class Handler(BaseHTTPRequestHandler):
         full = (ROOT / item["path"]).resolve()
         if ROOT not in full.parents:
             return self.send_json({"error": "forbidden"}, 403)
-        keyed = q.get("k", [""])[0] == file_key(item)
+        if self.stale_key(item, q):
+            return
+        keyed = "k" in q
         clip = make_preview(item)
         if clip:
             touch_used(clip)
@@ -742,7 +789,10 @@ def cache_control(cache, immutable):
 def sweep_loop():
     while True:
         time.sleep(SWEEP_EVERY)
-        log.info("Cache sweep removed %d stale files", sweep_cache())
+        try:
+            log.info("Cache sweep removed %d stale files", sweep_cache())
+        except Exception:
+            log.exception("Cache sweep failed")
 
 
 def display_host(host):

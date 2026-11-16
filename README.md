@@ -61,13 +61,13 @@ Thumbnails and preview clips live outside the media folder, in `~/.cache/civit-r
 ```mermaid
 flowchart TD
     A["Grid asks GET /preview/id?k=key"] --> B{"Clip cached?"}
-    B -->|yes| C["Touch last-use stamp, serve clip"]
+    B -->|yes| C["Touch last-use stamp (at most daily), serve clip"]
     B -->|no| D{"Failed before?"}
     D -->|yes| H["Serve original video"]
     D -->|no| E["ffmpeg makes 6 s clip"]
     E --> F{"ffmpeg ok?"}
     F -->|yes| G["Save in cache, serve clip"]
-    F -->|no| I["Remember FAILED, serve original video"]
+    F -->|"no: ffmpeg missing or failed"| I["Remember FAILED, serve original video"]
 ```
 
 ## Rename
