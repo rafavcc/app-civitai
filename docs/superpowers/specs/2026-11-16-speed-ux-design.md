@@ -26,6 +26,14 @@ The gallery is used mostly from an iPhone over the LAN. The library is mostly vi
    - Same name → no-op success. The tile's label and the lightbox info update in place; the cached thumbnail and clip are carried over to the new name instead of regenerated.
    - Errors show inside the sheet, which stays open.
 
+9. **Report.** A small **Report** button in the second header row opens a read-only sheet (approved by Rafael 2026-11-16) showing:
+   - Thumbnails and preview clips: file count, total size, oldest last use (days ago, against the 30-day sweep).
+   - Clips: videos in the current folder that have no clip yet, and thumbnails/clips that failed in this process.
+   - The old project `.cache/thumbs` folder size while it still exists (a reminder to delete it).
+   - This folder: image and video counts and the originals' total size.
+   - This page (from the browser's own timing data): load time, bytes downloaded, files served from the browser cache vs. the network. Shows "n/a" where the browser doesn't report it.
+   - No "clear cache" action: the sweep already cleans up.
+
 ## Non-goals
 
 - Re-encoding originals, HLS/adaptive streaming, HTTP/2.
