@@ -444,6 +444,149 @@ class Previews(GalleryTestCase):
         self.assertFalse(server.PREVIEW_DIR.exists() and self.files_under(server.PREVIEW_DIR))
 
 
+class OnlineOnly(GalleryTestCase):
+    """Online-only iCloud files: give up after FETCH_WAIT, keep the download going, never touch ffmpeg/FAILED."""
+
+    def setUp(self):
+        super().setUp()
+        self.gate = threading.Event()
+        self.started = []
+        self.saved_wait = server.FETCH_WAIT
+        server.FETCH_WAIT = 0.2
+
+        def fake_read(path):
+            self.started.append(Path(path).name)
+            self.gate.wait(10)
+
+        self.patches = [mock.patch.object(server, "is_online_only", lambda p: Path(p).name in self.online),
+                        mock.patch.object(server, "_read_fully", fake_read)]
+        self.online = {"a.png", "clip.mp4"}
+        server.FFMPEG = None  # restored by GalleryTestCase.tearDown; keeps background thumbnails quiet
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        self.gate.set()
+        for p in self.patches:
+            p.stop()
+        server.FETCH_WAIT = self.saved_wait
+        deadline = time.time() + 5
+        while server._FETCHING and time.time() < deadline:
+            time.sleep(0.01)
+        super().tearDown()
+
+    def item(self, name):
+        return next(i for i in self.items()["items"] if i["name"] == name)
+
+    def no_ffmpeg_calls(self):
+        stack = contextlib.ExitStack()
+        for name in ("make_thumb", "make_preview"):
+            stack.enter_context(mock.patch.object(server, name, side_effect=AssertionError(f"{name} must not run")))
+        stack.enter_context(mock.patch.object(server.subprocess, "run", side_effect=AssertionError("ffmpeg must not run")))
+        return stack
+
+    def test_thumb_times_out_with_503_and_keeps_fetching(self):
+        it = self.item("a.png")
+        with self.no_ffmpeg_calls():
+            status, body, h = get(f"{self.base}/thumb/{it['id']}")
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body), {"error": "downloading"})
+        self.assertEqual(h["Cache-Control"], "no-store")
+        self.assertEqual(h["Retry-After"], "10")
+        self.assertEqual(server.FAILED, set())
+        self.assertIn(str(self.root / "a.png"), server._FETCHING)
+        self.assertEqual(self.started, ["a.png"])
+        self.gate.set()
+        deadline = time.time() + 5
+        while server._FETCHING and time.time() < deadline:
+            time.sleep(0.01)
+        self.online.clear()  # iCloud finished: the file is a normal local file now
+        server.FFMPEG = None
+        status, body, _ = get(f"{self.base}/thumb/{it['id']}")
+        self.assertEqual((status, body), (200, PNG))
+
+    def test_thumb_served_when_fetch_finishes_in_time(self):
+        server.FETCH_WAIT = 5
+        it = self.item("a.png")
+        server.FFMPEG = None
+        threading.Timer(0.1, self.gate.set).start()
+        status, body, _ = get(f"{self.base}/thumb/{it['id']}")
+        self.assertEqual((status, body), (200, PNG))
+
+    def test_concurrent_requests_share_one_fetch(self):
+        it = self.item("a.png")
+        results = []
+        ts = [threading.Thread(target=lambda: results.append(get(f"{self.base}/thumb/{it['id']}")[0])) for _ in range(2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(results, [503, 503])
+        self.assertEqual(self.started, ["a.png"])
+
+    def test_preview_timeout_is_503_not_the_original(self):
+        it = self.item("clip.mp4")
+        with self.no_ffmpeg_calls():
+            status, body, h = get(f"{self.base}/preview/{it['id']}")
+        self.assertEqual(status, 503)
+        self.assertEqual((h["Cache-Control"], h["Retry-After"]), ("no-store", "10"))
+        self.assertEqual(server.FAILED, set())
+
+    def test_local_files_start_no_fetch(self):
+        self.online.clear()
+        server.FFMPEG = None
+        status, body, _ = get(f"{self.base}/thumb/{self.item('a.png')['id']}")
+        self.assertEqual((status, body), (200, PNG))
+        get(f"{self.base}/preview/{self.item('clip.mp4')['id']}")
+        self.assertEqual(self.started, [])
+        self.assertEqual(server._FETCHING, {})
+
+    def test_warm_skips_online_only_items(self):
+        self.online = {"a.png", "bb.png", "clip.mp4"}
+        with self.no_ffmpeg_calls():
+            server.warm(server.SCAN_VERSION)
+        self.assertEqual(self.started, [])
+        self.assertEqual(server._FETCHING, {})
+
+    def test_fetch_failure_still_releases_waiters(self):
+        def boom(path):
+            raise OSError("gone")
+        with mock.patch.object(server, "_read_fully", boom), self.assertLogs("gallery", "WARNING"):
+            ev = server.fetch(self.root / "a.png")
+            self.assertTrue(ev.wait(5))
+        deadline = time.time() + 5
+        while server._FETCHING and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(server._FETCHING, {})
+
+
+class TransientFfmpegErrors(GalleryTestCase):
+    def item(self, name):
+        return next(i for i in self.items()["items"] if i["name"] == name)
+
+    def test_timeout_is_not_remembered_as_failed(self):
+        server.FFMPEG = "/usr/bin/ffmpeg"
+        it = self.item("clip.mp4")
+        boom = subprocess.TimeoutExpired("ffmpeg", 1)
+        with mock.patch.object(server.subprocess, "run", side_effect=boom), self.assertLogs("gallery", "WARNING"):
+            self.assertIsNone(server.make_thumb(it))
+            self.assertIsNone(server.make_preview(it))
+        self.assertEqual(server.FAILED, set())
+
+    def test_real_ffmpeg_error_is_remembered_as_failed(self):
+        server.FFMPEG = "/usr/bin/ffmpeg"
+        it = self.item("clip.mp4")
+        boom = subprocess.CalledProcessError(1, "ffmpeg", stderr=b"bad")
+        with mock.patch.object(server.subprocess, "run", side_effect=boom), self.assertLogs("gallery", "WARNING"):
+            server.make_thumb(it)
+            server.make_preview(it)
+        self.assertEqual(len(server.FAILED), 2)
+
+    def test_is_online_only_false_for_real_local_file(self):
+        self.assertFalse(server.is_online_only(self.root / "a.png"))
+        self.assertFalse(server.is_online_only(self.root / "missing.png"))
+
+
 class Actions(GalleryTestCase):
     def post(self, path, body):
         return post_json(f"{self.base}{path}", body)

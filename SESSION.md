@@ -73,5 +73,6 @@ flowchart LR
 - Failure memory (`FAILED`) is in memory only: a restart retries failed thumbs/clips once.
 - First visit to a folder pays clip encoding (background warm helps; ~0.35 s per clip on the test file).
 - The `k` key is `mtime-size`: two different files with identical mtime and size at the same id would collide (practically only on in-place edits that keep both).
+- iCloud online-only files (`st_size > 0`, `st_blocks == 0`): `/thumb` and `/preview` start a background download (deduped, 4 at a time, still runs after the request gives up) and wait 10 s (`FETCH_WAIT`); if not there yet they answer 503 `{"error": "downloading"}` (`no-store`, `Retry-After: 10`), never touching ffmpeg or `FAILED`; the tile stays empty until a later view. Warm-up skips such files; ffmpeg timeouts are not remembered as failed.
 - ffmpeg thumbnails may ignore EXIF rotation on some builds.
 - Ideas: AI-generation metadata (A1111/ComfyUI PNG prompts) in the lightbox, favorites/tags, filesystem watcher instead of Rescan.

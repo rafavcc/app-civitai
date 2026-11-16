@@ -64,6 +64,7 @@ function tile(it, index) {
     d.innerHTML = `<img loading="lazy" decoding="async" src="${thumb}" width="${it.width || '600'}" height="${it.height || '450'}">`;
     const im = d.firstChild;
     im.onload = () => markWide(d, im.naturalWidth, im.naturalHeight);
+    im.onerror = () => { im.style.visibility = 'hidden'; };  // e.g. 503 while iCloud downloads: empty tile, no broken icon
   } else {
     d.innerHTML = `<video muted loop playsinline preload="metadata" poster="${thumb}" data-src="${url('preview', it)}"></video>`;
     const v = d.firstChild;

@@ -55,6 +55,10 @@ THUMB_SLOTS = threading.Semaphore(4)  # bound concurrent ffmpeg processes
 PREVIEW_SLOTS = threading.Semaphore(2)  # clip encodes are heavy; keep them few
 WARM = True  # pre-generate thumbnails and clips in the background after a scan
 FAILED: set[str] = set()  # "kind:cache_key" whose generation failed in this process; not retried
+FETCH_SLOTS = threading.Semaphore(4)  # bound concurrent whole-file reads of online-only files
+FETCH_WAIT = 10  # seconds a request waits for an online-only file before answering 503
+_FETCHING: dict[str, threading.Event] = {}  # source path -> Event set when its background read ends
+_FETCH_LOCK = threading.Lock()
 log = logging.getLogger("gallery")
 LINK_UNSUPPORTED = {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EMLINK}
 
@@ -186,6 +190,57 @@ def parse_ids(body):
     return ids
 
 
+def is_online_only(path):
+    """True for an iCloud placeholder (size known, no blocks on disk). os.stat does not trigger a download."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return st.st_size > 0 and st.st_blocks == 0
+
+
+def _read_fully(path):
+    """Reads the whole file and discards it: this is what makes iCloud download it."""
+    with open(path, "rb") as f:
+        while f.read(1 << 20):
+            pass
+
+
+def _fetch_worker(path, key, event):
+    try:
+        with FETCH_SLOTS:
+            _read_fully(path)
+        ok = True
+    except Exception as e:
+        ok = False
+        log.warning("Download failed for %s: %s", path, e)
+    finally:
+        event.set()
+        with _FETCH_LOCK:
+            _FETCHING.pop(key, None)
+    if ok:
+        try:
+            with LOCK:
+                items = list(ITEMS)
+            for item in items:
+                if not item.get("moved") and str(ROOT / item["path"]) == key:
+                    make_thumb(item)
+                    break
+        except Exception:
+            log.exception("Thumbnail after download failed for %s", path)
+
+
+def fetch(path):
+    """Starts (once per path) a background read of an online-only file; returns an Event set when it ends."""
+    key = str(path)
+    with _FETCH_LOCK:
+        event = _FETCHING.get(key)
+        if event is None:
+            event = _FETCHING[key] = threading.Event()
+            threading.Thread(target=_fetch_worker, args=(path, key, event), daemon=True).start()
+    return event
+
+
 def make_thumb(item):
     """Returns the cached thumbnail path (creating it with ffmpeg if needed), or None on failure."""
     if not FFMPEG:
@@ -214,6 +269,9 @@ def make_thumb(item):
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             os.replace(tmp, out)
             return out
+        except subprocess.TimeoutExpired:
+            log.warning("Thumbnail timed out for %s (not remembered as failed)", item["path"])
+            return None
         except (subprocess.SubprocessError, OSError) as e:
             FAILED.add(fail_key)
             log.warning("Thumbnail failed for %s: %s", item["path"], getattr(e, "stderr", e))
@@ -251,6 +309,9 @@ def make_preview(item, wait=True):
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             os.replace(tmp, out)
             return out
+        except subprocess.TimeoutExpired:
+            log.warning("Preview timed out for %s (not remembered as failed)", item["path"])
+            return None
         except (subprocess.SubprocessError, OSError) as e:
             FAILED.add(fail_key)
             log.warning("Preview failed for %s: %s", item["path"], getattr(e, "stderr", e))
@@ -269,6 +330,8 @@ def warm(version):
         if SCAN_VERSION != version:
             return
         if item.get("moved"):
+            continue
+        if is_online_only(ROOT / item["path"]):  # never start a download from the warm-up
             continue
         try:
             make_thumb(item)
@@ -347,10 +410,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self.path.startswith("/media/"):
             log.info("%s %s", self.address_string(), fmt % args)
 
-    def send_json(self, obj, status=200, no_store=False):
+    def send_json(self, obj, status=200, no_store=False, headers=None):
         body = json.dumps(obj).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         if no_store:
             self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
@@ -689,6 +754,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_file(full, immutable="k" in q)
 
+    def still_downloading(self, full):
+        """For an online-only file: starts its download and waits up to FETCH_WAIT. If it is not there yet,
+        answers 503 (the download keeps going) and returns True."""
+        if is_online_only(full) and not fetch(full).wait(FETCH_WAIT):
+            self.send_json({"error": "downloading"}, 503, no_store=True, headers={"Retry-After": "10"})
+            return True
+        return False
+
     def thumb(self, idx, q):
         item = get_item(idx)
         if item is None or item.get("moved"):
@@ -699,6 +772,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.stale_key(item, q):
             return
         keyed = "k" in q
+        if not thumb_path(item).is_file() and self.still_downloading(full):
+            return
         t = make_thumb(item)
         if t:
             touch_used(t)
@@ -717,6 +792,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.stale_key(item, q):
             return
         keyed = "k" in q
+        if not preview_path(item).is_file() and self.still_downloading(full):
+            return
         clip = make_preview(item)
         if clip:
             touch_used(clip)
