@@ -68,6 +68,13 @@
   .cbtns { display: flex; gap: 10px; }
   .cbtns button { flex: 1; padding: 12px; border-radius: 10px; font-size: 15px; cursor: pointer; background: #25262b; color: inherit; border: 1px solid #373a40; }
   #cok { background: #c92a2a; border-color: #c92a2a; color: #fff; font-weight: 600; }
+  .rnrow { display: flex; align-items: center; gap: 6px; margin: 14px 0 8px; }
+  #rnname { flex: 1; min-width: 0; font-size: 16px; padding: 10px 12px; border-radius: 10px; background: #25262b; color: inherit; border: 1px solid #373a40; }
+  #rnext { flex: none; font-size: 16px; opacity: .6; }
+  #rnerr { color: #ffa8a8; margin: 0 0 12px; min-height: 0; }
+  #rnerr:empty { display: none; }
+  #rnok { background: #1c7ed6; border-color: #1c7ed6; color: #fff; font-weight: 600; }
+  #rnok:disabled { opacity: .5; }
   @media (min-width: 701px) { .scrim { align-items: center; } .sheet { border-radius: 16px; padding-bottom: 18px; } }
 
   /* Multi-select: spinning rainbow ring, selection bar, press feedback.

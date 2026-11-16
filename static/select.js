@@ -74,6 +74,69 @@ function confirmDelete(items) {
   });
 }
 
+// Rename sheet for the lightbox item. The server takes the stem and keeps the extension.
+let closeRename = null;
+function openRename(it) {
+  closeRename?.();
+  const box = $('rename'), input = $('rnname'), ok = $('rnok');
+  const dot = it.name.lastIndexOf('.');
+  const ext = dot > 0 ? it.name.slice(dot) : '';
+  input.value = it.name.slice(0, it.name.length - ext.length);
+  $('rnext').textContent = ext;
+  $('rnerr').textContent = '';
+  ok.disabled = false;
+  const finish = () => {
+    box.classList.remove('open');
+    removeEventListener('keydown', onKey, true);
+    box.removeEventListener('click', onScrim);
+    input.onkeydown = $('rncancel').onclick = ok.onclick = null;
+    closeRename = null;
+  };
+  // Capture phase so Esc closes only the sheet, not the lightbox underneath
+  const onKey = e => {
+    if (e.key !== 'Escape') return;
+    e.stopPropagation();
+    finish();
+  };
+  const onScrim = e => { if (e.target === box) finish(); };
+  const submit = async () => {
+    if (ok.disabled) return;
+    ok.disabled = true;
+    let res, data;
+    try {
+      res = await fetch('/api/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: it.id, ver, name: input.value }),
+      });
+      data = await res.json();
+    } catch (e) {
+      if (closeRename === finish) { $('rnerr').textContent = 'Network error'; ok.disabled = false; }
+      return;
+    }
+    if (closeRename !== finish) return;  // sheet was closed meanwhile
+    if (res.status === 409) { finish(); toast('Folder changed — reload to continue'); return; }
+    if (!res.ok || !data.ok) { $('rnerr').textContent = data.error || 'Request failed'; ok.disabled = false; return; }
+    it.name = data.name;
+    it.path = data.path;
+    const label = it.el?.querySelector('.label');
+    if (label) label.textContent = it.path;
+    if (listed[cur] === it) $('lbinfo').textContent = `${it.path} · ${(it.size / 1048576).toFixed(2)} MB · ${new Date(it.mtime * 1000).toLocaleString()}`;
+    finish();
+    toast('Renamed to ' + it.name, 'ok');
+  };
+  closeRename = finish;
+  addEventListener('keydown', onKey, true);
+  box.addEventListener('click', onScrim);
+  input.onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); submit(); } };
+  $('rncancel').onclick = finish;
+  ok.onclick = submit;
+  box.classList.add('open');
+  input.focus();
+  input.select();
+}
+$('renbtn').onclick = () => { const it = listed[cur]; if (it) openRename(it); };
+
 // Selection mode: long-press / Ctrl-click starts it, then plain clicks toggle. State is a Set of `listed` entries.
 const picked = new Set();
 const Sel = {
