@@ -138,7 +138,7 @@ $('backbtn').onclick = closeLb;
 $('lb').onclick = e => { if (e.target === $('lb')) closeLb(); };
 addEventListener('keydown', e => {
   if (cur < 0) return;
-  if (e.target.closest?.('input, textarea') || $('rename').classList.contains('open')) return;
+  if (e.target.closest?.('input, textarea') || $('rename').classList.contains('open') || $('reportsheet').classList.contains('open')) return;
   if ($('mv').classList.contains('open')) { if (e.key === 'Escape') closeMv(); return; }
   if (e.key === 'Escape') closeLb();
   if (e.key === 'ArrowRight') openLb(Math.min(cur + 1, listed.length - 1), 1);

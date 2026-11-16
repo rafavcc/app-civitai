@@ -32,6 +32,8 @@ STATE_FILE = APP_DIR / "state.json"
 CACHE_ROOT = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "civit-rv"
 CACHE_DIR = CACHE_ROOT / "thumbs"
 PREVIEW_DIR = CACHE_ROOT / "previews"
+# Pre-move thumbnail folder inside the project; only read, to remind the user to delete it
+LEGACY_THUMBS = APP_DIR.resolve() / ".cache" / "thumbs"
 CACHE_MAX_AGE = 30 * 86400  # cached files unused for this long are swept
 TOUCH_EVERY = 86400  # refresh a file's last-use time at most this often
 SWEEP_EVERY = 86400
@@ -145,6 +147,28 @@ def sweep_cache(now=None):
                 except OSError:
                     pass
     return removed
+
+
+def cache_stats(d):
+    """File count, bytes and oldest mtime under d (regular files only, no symlinks, no *.tmp.*). None if d is missing."""
+    if not os.path.isdir(d):
+        return None
+    files = total = 0
+    oldest = None
+    for dirpath, _dirs, names in os.walk(d, followlinks=False):
+        for name in names:
+            if ".tmp." in name:
+                continue
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            files += 1
+            total += st.st_size
+            oldest = st.st_mtime if oldest is None else min(oldest, st.st_mtime)
+    return {"files": files, "bytes": total, "oldest_use": oldest}
 
 
 def parse_ids(body):
@@ -345,6 +369,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.list_folders(q.get("path", [None])[0])
             if url.path == "/api/rescan":
                 return self.send_json({"count": scan()})
+            if url.path == "/api/report":
+                return self.api_report()
             if url.path.startswith("/media/"):
                 return self.media(int(url.path[7:]), q)
             if url.path.startswith("/thumb/"):
@@ -557,6 +583,30 @@ class Handler(BaseHTTPRequestHandler):
         if new is None:
             return self.send_json({"error": "Invalid folder"}, 400)
         self.set_folder(new)
+
+    def api_report(self):
+        with LOCK:
+            items = [it for it in ITEMS if not it.get("moved")]
+        videos = [it for it in items if it["kind"] == "video"]
+        body = json.dumps({
+            "thumbs": cache_stats(CACHE_DIR),
+            "previews": cache_stats(PREVIEW_DIR),
+            "legacy_thumbs": cache_stats(LEGACY_THUMBS),
+            "failed": {k: sum(1 for f in list(FAILED) if f.startswith(k + ":")) for k in ("thumb", "preview")},
+            "folder": {
+                "images": len(items) - len(videos),
+                "videos": len(videos),
+                "bytes": sum(it["size"] for it in items),
+                "videos_without_clip": sum(1 for it in videos if not preview_path(it).exists()),
+            },
+            "max_age_days": CACHE_MAX_AGE // 86400,
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def api_items(self, q):
         offset = max(0, int(q.get("offset", ["0"])[0]))

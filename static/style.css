@@ -8,7 +8,7 @@
   }
   header { position: sticky; top: 0; z-index: 10; display: flex; flex-direction: column; gap: 6px;
            padding: calc(8px + var(--sat)) calc(16px + var(--sar)) 8px calc(16px + var(--sal)); background: #141517; border-bottom: 1px solid #2c2e33; }
-  .header-row { display: flex; gap: 8px; align-items: center; }
+  .header-row { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; }
   header input[type=search], header select, header button { background: #25262b; color: inherit; border: 1px solid #373a40;
            border-radius: 6px; padding: 6px 10px; font-size: 14px; }
   header input[type=search] { flex: 1; min-width: 0; }
@@ -75,6 +75,11 @@
   #rnerr:empty { display: none; }
   #rnok { background: #1c7ed6; border-color: #1c7ed6; color: #fff; font-weight: 600; }
   #rnok:disabled { opacity: .5; }
+  #rpbody { text-align: left; max-height: 60vh; overflow-y: auto; margin-bottom: 14px; font-size: 14px; }
+  .rpsec { margin-bottom: 12px; }
+  .rpsec h4 { margin: 0 0 4px; font-size: 13px; opacity: .6; text-transform: uppercase; letter-spacing: .04em; }
+  .rprow { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
+  .rprow b { font-weight: 600; text-align: right; }
   @media (min-width: 701px) { .scrim { align-items: center; } .sheet { border-radius: 16px; padding-bottom: 18px; } }
 
   /* Multi-select: spinning rainbow ring, selection bar, press feedback.

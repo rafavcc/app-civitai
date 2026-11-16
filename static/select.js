@@ -137,6 +137,71 @@ function openRename(it) {
 }
 $('renbtn').onclick = () => { const it = listed[cur]; if (it) openRename(it); };
 
+// Report sheet: read-only cache, folder and page statistics
+function fmtBytes(n) {
+  if (!Number.isFinite(n)) return 'n/a';
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return Math.round(n / 1024) + ' KB';
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+  return (n / 1073741824).toFixed(1) + ' GB';
+}
+function pageStats() {
+  const nav = performance.getEntriesByType?.('navigation')?.[0];
+  const entries = [...(performance.getEntriesByType?.('resource') || []), ...(nav ? [nav] : [])];
+  const load = nav && nav.loadEventEnd > 0 ? ((nav.loadEventEnd - nav.startTime) / 1000).toFixed(2) + ' s' : 'n/a';
+  if (!entries.length || !entries.some(e => 'transferSize' in e)) return { load, bytes: 'n/a', cached: 'n/a', network: 'n/a' };
+  let bytes = 0, cached = 0, network = 0;
+  for (const e of entries) {
+    bytes += e.transferSize || 0;
+    if (e.transferSize === 0 && e.decodedBodySize > 0) cached++; else network++;
+  }
+  return { load, bytes: fmtBytes(bytes), cached, network };
+}
+function reportHtml(r) {
+  const age = c => c.oldest_use == null ? 'n/a'
+    : Math.max(0, Math.floor((Date.now() / 1000 - c.oldest_use) / 86400)) + ` days ago (deleted after ${r.max_age_days})`;
+  const cache = (title, c) => section(title, c ? [['Files', c.files], ['Size', fmtBytes(c.bytes)], ['Oldest use', age(c)]] : [['Files', 'none']]);
+  const p = pageStats(), f = r.folder;
+  return cache('Thumbnails', r.thumbs) + cache('Preview clips', r.previews) +
+    section('Clips', [['Videos without a clip', f.videos_without_clip], ['Failed thumbnails', r.failed.thumb], ['Failed clips', r.failed.preview]]) +
+    (r.legacy_thumbs ? section('Old thumbs folder', [['Files', r.legacy_thumbs.files], ['Size', fmtBytes(r.legacy_thumbs.bytes)], ['Note', 'You can delete .cache/thumbs']]) : '') +
+    section('This folder', [['Images', f.images], ['Videos', f.videos], ['Originals', fmtBytes(f.bytes)]]) +
+    section('This page', [['Load time', p.load], ['Downloaded', p.bytes], ['From browser cache', p.cached], ['From network', p.network]]);
+}
+function section(title, rows) {
+  const esc = v => String(v).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  return `<section class="rpsec"><h4>${esc(title)}</h4>` + rows.map(([k, v]) => `<div class="rprow"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('') + '</section>';
+}
+let closeReport = null;
+function openReport() {
+  closeReport?.();
+  const box = $('reportsheet'), body = $('rpbody');
+  body.textContent = 'Loading…';
+  const finish = () => {
+    box.classList.remove('open');
+    removeEventListener('keydown', onKey, true);
+    box.removeEventListener('click', onScrim);
+    $('rpclose').onclick = null;
+    closeReport = null;
+  };
+  // Capture phase so Esc closes only the sheet, not the lightbox underneath
+  const onKey = e => {
+    if (e.key !== 'Escape') return;
+    e.stopPropagation();
+    finish();
+  };
+  const onScrim = e => { if (e.target === box) finish(); };
+  closeReport = finish;
+  addEventListener('keydown', onKey, true);
+  box.addEventListener('click', onScrim);
+  $('rpclose').onclick = finish;
+  box.classList.add('open');
+  fetch('/api/report', { cache: 'no-store' }).then(res => { if (!res.ok) throw 0; return res.json(); }).then(r => {
+    if (closeReport === finish) body.innerHTML = reportHtml(r);
+  }).catch(() => { if (closeReport === finish) body.textContent = "Couldn't load the report"; });
+}
+$('report').onclick = openReport;
+
 // Selection mode: long-press / Ctrl-click starts it, then plain clicks toggle. State is a Set of `listed` entries.
 const picked = new Set();
 const Sel = {
@@ -219,7 +284,7 @@ grid.addEventListener('contextmenu', e => {
 grid.addEventListener('dragstart', e => { if (tileItem(e)) e.preventDefault(); });
 addEventListener('keydown', e => {
   if (e.key !== 'Escape' || !Sel.active) return;
-  if (cur >= 0 || $('mv').classList.contains('open') || $('confirm').classList.contains('open')) return;
+  if (cur >= 0 || $('mv').classList.contains('open') || $('confirm').classList.contains('open') || $('reportsheet').classList.contains('open')) return;
   Sel.clear();
 });
 

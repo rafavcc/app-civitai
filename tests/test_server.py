@@ -69,8 +69,9 @@ class GalleryTestCase(unittest.TestCase):
         server.BASE = self.tmp
         server.ROOT = self.root
         # Keep tests away from the real state file and thumbnail cache
-        self._saved = (server.STATE_FILE, server.CACHE_DIR, server.PREVIEW_DIR, server.FFMPEG, server.WARM)
+        self._saved = (server.STATE_FILE, server.CACHE_DIR, server.PREVIEW_DIR, server.FFMPEG, server.WARM, server.LEGACY_THUMBS)
         server.WARM = False
+        server.LEGACY_THUMBS = self.tmp / "no-legacy"
         server.STATE_FILE = self.tmp / "state.json"
         server.CACHE_DIR = self.tmp / "cache"
         server.PREVIEW_DIR = self.tmp / "previews"
@@ -81,7 +82,7 @@ class GalleryTestCase(unittest.TestCase):
     def tearDown(self):
         self.srv.shutdown()
         self.srv.server_close()
-        server.STATE_FILE, server.CACHE_DIR, server.PREVIEW_DIR, server.FFMPEG, server.WARM = self._saved
+        server.STATE_FILE, server.CACHE_DIR, server.PREVIEW_DIR, server.FFMPEG, server.WARM, server.LEGACY_THUMBS = self._saved
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def items(self, **params):
@@ -565,6 +566,74 @@ class Actions(GalleryTestCase):
         self.assertEqual(server.load_state()["folder"], str(self.tmp / "other"))
         status, r = jget(f"{self.base}/api/folder?path=")
         self.assertEqual((status, r["path"]), (200, ""))
+
+
+class Report(GalleryTestCase):
+    def test_cache_stats_counts_files_and_bytes(self):
+        d = self.tmp / "st"
+        (d / "aa").mkdir(parents=True)
+        (d / "bb").mkdir()
+        (d / "aa" / "1.jpg").write_bytes(b"abc")
+        (d / "bb" / "2.jpg").write_bytes(b"12345")
+        os.utime(d / "aa" / "1.jpg", (5000, 5000))
+        os.utime(d / "bb" / "2.jpg", (9000, 9000))
+        self.assertEqual(server.cache_stats(d), {"files": 2, "bytes": 8, "oldest_use": 5000})
+
+    def test_cache_stats_skips_tmp_and_symlinks(self):
+        d = self.tmp / "st"
+        (d / "aa").mkdir(parents=True)
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "big.jpg").write_bytes(b"z" * 100)
+        (d / "aa" / "1.jpg").write_bytes(b"abc")
+        (d / "aa" / "x.tmp.123").write_bytes(b"tmp")
+        os.symlink(outside / "big.jpg", d / "aa" / "link.jpg")
+        os.symlink(outside, d / "linkdir")
+        self.assertEqual(server.cache_stats(d)["files"], 1)
+        self.assertEqual(server.cache_stats(d)["bytes"], 3)
+
+    def test_cache_stats_missing_dir_is_none(self):
+        self.assertIsNone(server.cache_stats(self.tmp / "nope"))
+
+    def report(self):
+        status, data = jget(f"{self.base}/api/report")
+        self.assertEqual(status, 200)
+        return data
+
+    def test_report_shape(self):
+        r = self.report()
+        for k in ("thumbs", "previews", "legacy_thumbs", "failed", "folder", "max_age_days"):
+            self.assertIn(k, r)
+        self.assertEqual(r["max_age_days"], 30)
+        self.assertIsNone(r["legacy_thumbs"])
+        self.assertEqual(r["failed"], {"thumb": 0, "preview": 0})
+        self.assertEqual(r["folder"], {"images": 2, "videos": 1, "bytes": len(PNG) * 3 + 1000, "videos_without_clip": 1})
+        _, _, h = get(f"{self.base}/api/report")
+        self.assertEqual(h["Cache-Control"], "no-cache")
+
+    def test_report_counts_clips_and_failed(self):
+        video = next(i for i in server.ITEMS if i["kind"] == "video")
+        p = server.preview_path(video)
+        p.parent.mkdir(parents=True)
+        p.write_bytes(b"clip")
+        server.FAILED.update({"preview:x", "thumb:y"})
+        r = self.report()
+        self.assertEqual(r["folder"]["videos_without_clip"], 0)
+        self.assertEqual(r["failed"], {"thumb": 1, "preview": 1})
+        self.assertEqual(r["previews"]["files"], 1)
+
+    def test_report_writes_nothing(self):
+        def snap():
+            out = {}
+            for base in (self.root, server.CACHE_DIR, server.PREVIEW_DIR):
+                for dp, dn, fn in os.walk(base):
+                    for n in dn + fn:
+                        f = os.path.join(dp, n)
+                        out[f] = os.lstat(f).st_mtime_ns
+            return out
+        before = snap()
+        self.report()
+        self.assertEqual(snap(), before)
 
 
 class Rename(GalleryTestCase):
