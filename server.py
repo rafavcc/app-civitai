@@ -49,6 +49,8 @@ LOCK = threading.Lock()
 SCAN_VERSION = time.time_ns() // 1000
 FFMPEG = shutil.which("ffmpeg")
 THUMB_SLOTS = threading.Semaphore(4)  # bound concurrent ffmpeg processes
+PREVIEW_SLOTS = threading.Semaphore(2)  # clip encodes are heavy; keep them few
+WARM = True  # pre-generate thumbnails and clips in the background after a scan
 FAILED: set[str] = set()  # "kind:cache_key" whose generation failed in this process; not retried
 log = logging.getLogger("gallery")
 
@@ -88,10 +90,14 @@ def thumb_path(item):
     return CACHE_DIR / key[:2] / f"{key}.jpg"
 
 
+def preview_path(item):
+    key = cache_key(item)
+    return PREVIEW_DIR / key[:2] / f"{key}.mp4"
+
+
 def drop_thumb(item):
     # A deleted file's cached thumbnail and preview would otherwise linger until swept
-    key = cache_key(item)
-    for p in (thumb_path(item), PREVIEW_DIR / key[:2] / f"{key}.mp4"):
+    for p in (thumb_path(item), preview_path(item)):
         try:
             p.unlink(missing_ok=True)
         except OSError:
@@ -173,6 +179,57 @@ def make_thumb(item):
             tmp.unlink(missing_ok=True)
 
 
+def make_preview(item):
+    """Returns the cached 6 s silent preview clip path (encoding it if needed), or None on failure."""
+    if not FFMPEG:
+        return None
+    out = preview_path(item)
+    if out.is_file():
+        return out
+    fail_key = f"preview:{cache_key(item)}"
+    if fail_key in FAILED:
+        return None
+    src = ROOT / item["path"]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(f"{out.name}.{threading.get_ident()}.tmp.mp4")
+    cmd = [FFMPEG, "-v", "error", "-y", "-ss", "0.1", "-i", str(src), "-t", "6", "-an",
+           "-vf", "fps=24,scale='min(480,iw)':-2", "-c:v", "libx264", "-preset", "veryfast",
+           "-crf", "30", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(tmp)]
+    with PREVIEW_SLOTS:
+        if out.is_file():  # another request finished it while we waited
+            return out
+        if fail_key in FAILED:
+            return None
+        try:
+            subprocess.run(cmd, check=True, timeout=120, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            os.replace(tmp, out)
+            return out
+        except (subprocess.SubprocessError, OSError) as e:
+            FAILED.add(fail_key)
+            log.warning("Preview failed for %s: %s", item["path"], getattr(e, "stderr", e))
+            return None
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def warm(version):
+    """Pre-generates thumbnails and clips for the current items, newest first, until the folder changes."""
+    with LOCK:
+        items = list(ITEMS)
+    for item in items:
+        if SCAN_VERSION != version:
+            return
+        if item.get("moved"):
+            continue
+        try:
+            make_thumb(item)
+            if item["kind"] == "video" and SCAN_VERSION == version:
+                make_preview(item)
+        except Exception:
+            log.exception("Warm-up failed for %s", item.get("path"))
+
+
 def kind_of(name):
     ext = os.path.splitext(name)[1].lower()
     return "image" if ext in IMAGE_EXT else "video" if ext in VIDEO_EXT else None
@@ -221,7 +278,10 @@ def scan(root=None):
         ROOT = root
         ITEMS[:] = items
         SCAN_VERSION += 1
+        version = SCAN_VERSION
     log.info("Scanned %s: %d files", root, len(items))
+    if WARM and FFMPEG:
+        threading.Thread(target=warm, args=(version,), daemon=True).start()
     return len(items)
 
 
@@ -274,6 +334,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.media(int(url.path[7:]), q)
             if url.path.startswith("/thumb/"):
                 return self.thumb(int(url.path[7:]), q)
+            if url.path.startswith("/preview/"):
+                return self.preview(int(url.path[9:]), q)
         except (BrokenPipeError, ConnectionResetError):
             return
         except ValueError:  # non-numeric ids and similar malformed input
@@ -487,8 +549,22 @@ class Handler(BaseHTTPRequestHandler):
             touch_used(t)
             return self.send_file(t, immutable=keyed)
         if item["kind"] == "image":  # no ffmpeg or it failed: the original still works
-            return self.send_file(full, immutable=keyed)
+            return self.send_file(full)  # not immutable: a later thumbnail must not be hidden
         self.send_json({"error": "no thumbnail"}, 404)
+
+    def preview(self, idx, q):
+        item = get_item(idx)
+        if item is None or item.get("moved") or item["kind"] != "video":
+            return self.send_json({"error": "not found"}, 404)
+        full = (ROOT / item["path"]).resolve()
+        if ROOT not in full.parents:
+            return self.send_json({"error": "forbidden"}, 403)
+        keyed = q.get("k", [""])[0] == file_key(item)
+        clip = make_preview(item)
+        if clip:
+            touch_used(clip)
+            return self.send_file(clip, immutable=keyed)
+        self.send_file(full)  # no ffmpeg or it failed: the original; not immutable, a clip may come later
 
     def send_file(self, path: Path, cache=False, immutable=False):
         if not path.is_file():

@@ -69,7 +69,8 @@ class GalleryTestCase(unittest.TestCase):
         server.BASE = self.tmp
         server.ROOT = self.root
         # Keep tests away from the real state file and thumbnail cache
-        self._saved = (server.STATE_FILE, server.CACHE_DIR, server.PREVIEW_DIR, server.FFMPEG)
+        self._saved = (server.STATE_FILE, server.CACHE_DIR, server.PREVIEW_DIR, server.FFMPEG, server.WARM)
+        server.WARM = False
         server.STATE_FILE = self.tmp / "state.json"
         server.CACHE_DIR = self.tmp / "cache"
         server.PREVIEW_DIR = self.tmp / "previews"
@@ -80,7 +81,7 @@ class GalleryTestCase(unittest.TestCase):
     def tearDown(self):
         self.srv.shutdown()
         self.srv.server_close()
-        server.STATE_FILE, server.CACHE_DIR, server.PREVIEW_DIR, server.FFMPEG = self._saved
+        server.STATE_FILE, server.CACHE_DIR, server.PREVIEW_DIR, server.FFMPEG, server.WARM = self._saved
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def items(self, **params):
@@ -281,15 +282,137 @@ class Caching(GalleryTestCase):
             calls.append(a)
             return real(*a, **kw)
 
-        with mock.patch.object(server.subprocess, "run", counting):
+        with self.assertLogs("gallery", "WARNING"), mock.patch.object(server.subprocess, "run", counting):
             for _ in range(2):
-                status, body, _ = get(f"{self.base}/thumb/{it['id']}")
+                status, body, h = get(f"{self.base}/thumb/{it['id']}?k={it['k']}")
                 self.assertEqual((status, body), (200, b"not an image"))
+                self.assertNotIn("immutable", h["Cache-Control"])
         self.assertEqual(len(calls), 1)
 
     def test_cache_root_is_outside_project(self):
         self.assertEqual(CACHE_ROOT_DEFAULT.name, "civit-rv")
         self.assertNotIn(server.APP_DIR.resolve(), CACHE_ROOT_DEFAULT.resolve().parents)
+
+
+FFMPEG_PATH = shutil.which("ffmpeg")
+FFPROBE_PATH = shutil.which("ffprobe")
+
+
+def make_video(path, seconds=10):
+    subprocess.run([FFMPEG_PATH, "-v", "error", "-y", "-f", "lavfi", "-i", f"testsrc=s=1280x720:d={seconds}:r=24",
+                    "-f", "lavfi", "-i", f"sine=d={seconds}", "-shortest", "-pix_fmt", "yuv420p", str(path)],
+                   check=True)
+
+
+class Previews(GalleryTestCase):
+    def item(self, name):
+        return next(i for i in self.items()["items"] if i["name"] == name)
+
+    def files_under(self, p):
+        return {f for f in Path(p).rglob("*") if f.is_file()}
+
+    def counting(self):
+        real, calls = subprocess.run, []
+
+        def counting(*a, **kw):
+            calls.append(a)
+            return real(*a, **kw)
+
+        return calls, mock.patch.object(server.subprocess, "run", counting)
+
+    @unittest.skipUnless(FFMPEG_PATH, "ffmpeg not installed")
+    def test_preview_generated_cached_and_small(self):
+        server.FFMPEG = FFMPEG_PATH
+        make_video(self.root / "clip.mp4")
+        server.scan()
+        it = self.item("clip.mp4")
+        calls, patch = self.counting()
+        with patch:
+            status, body, h = get(f"{self.base}/preview/{it['id']}?k={it['k']}")
+            self.assertEqual(status, 200)
+            self.assertEqual(h["Content-Type"], "video/mp4")
+            self.assertIn("immutable", h["Cache-Control"])
+            status2, body2, _ = get(f"{self.base}/preview/{it['id']}?k={it['k']}")
+        self.assertEqual((status2, body2), (200, body))
+        self.assertEqual(len(calls), 1)
+        clips = list(server.PREVIEW_DIR.rglob("*.mp4"))
+        self.assertEqual(len(clips), 1)
+        self.assertEqual(clips[0], server.preview_path(next(i for i in server.ITEMS if i["name"] == "clip.mp4")))
+        if FFPROBE_PATH:
+            out = subprocess.run([FFPROBE_PATH, "-v", "error", "-show_entries", "stream=codec_type,width",
+                                  "-show_entries", "format=duration", "-of", "json", str(clips[0])],
+                                 check=True, capture_output=True, text=True).stdout
+            info = json.loads(out)
+            video = [s for s in info["streams"] if s["codec_type"] == "video"]
+            self.assertEqual(video[0]["width"], 480)
+            self.assertFalse([s for s in info["streams"] if s["codec_type"] == "audio"])
+            self.assertLessEqual(float(info["format"]["duration"]), 6.1)
+
+    def test_preview_falls_back_to_original(self):
+        server.FFMPEG = None
+        it = self.item("clip.mp4")
+        status, body, h = get(f"{self.base}/preview/{it['id']}?k={it['k']}")
+        self.assertEqual((status, body), (200, b"x" * 1000))
+        self.assertNotIn("immutable", h["Cache-Control"])
+
+    def test_preview_404_for_images_and_moved(self):
+        self.assertEqual(get(f"{self.base}/preview/{self.item('a.png')['id']}")[0], 404)
+        it = self.item("clip.mp4")
+        server.ITEMS[it["id"]]["moved"] = True
+        self.assertEqual(get(f"{self.base}/preview/{it['id']}")[0], 404)
+        self.assertEqual(get(f"{self.base}/preview/999")[0], 404)
+
+    @unittest.skipUnless(FFMPEG_PATH, "ffmpeg not installed")
+    def test_corrupt_video_preview_fails_once(self):
+        server.FFMPEG = FFMPEG_PATH
+        it = self.item("clip.mp4")
+        calls, patch = self.counting()
+        with self.assertLogs("gallery", "WARNING"), patch:
+            for _ in range(2):
+                status, body, _ = get(f"{self.base}/preview/{it['id']}?k={it['k']}")
+                self.assertEqual((status, body), (200, b"x" * 1000))
+        self.assertEqual(len(calls), 1)
+
+    @unittest.skipUnless(FFMPEG_PATH, "ffmpeg not installed")
+    def test_nothing_written_in_media_folder(self):
+        server.FFMPEG = FFMPEG_PATH
+        make_video(self.root / "clip.mp4", 2)
+        (self.root / "bb.png").unlink()  # undecodable fixtures would log ffmpeg failures
+        (self.root / "a.png").unlink()
+        server.scan()
+        before = self.files_under(self.root)
+        for it in self.items()["items"]:
+            get(f"{self.base}/thumb/{it['id']}")
+            if it["kind"] == "video":
+                get(f"{self.base}/preview/{it['id']}")
+        self.assertTrue(self.files_under(server.CACHE_DIR))
+        self.assertEqual(self.files_under(self.root), before)
+
+    @unittest.skipUnless(FFMPEG_PATH, "ffmpeg not installed")
+    def test_warm_generates_thumbs_and_previews(self):
+        server.FFMPEG = FFMPEG_PATH
+        make_video(self.root / "clip.mp4", 2)
+        for png in self.root.glob("*.png"):  # the fixture PNGs are not decodable; use real images
+            subprocess.run([FFMPEG_PATH, "-v", "error", "-f", "lavfi", "-i", "color=blue:s=64x64",
+                            "-frames:v", "1", "-y", str(png)], check=True)
+        server.WARM = True
+        server.scan()
+        want_thumbs = len(server.ITEMS)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if (len(list(server.CACHE_DIR.rglob("*.jpg"))) >= want_thumbs
+                    and len(list(server.PREVIEW_DIR.rglob("*.mp4"))) >= 1):
+                break
+            time.sleep(0.1)
+        self.assertEqual(len(list(server.CACHE_DIR.rglob("*.jpg"))), want_thumbs)
+        self.assertEqual(len(list(server.PREVIEW_DIR.rglob("*.mp4"))), 1)
+
+    @unittest.skipUnless(FFMPEG_PATH, "ffmpeg not installed")
+    def test_warm_stops_on_folder_change(self):
+        server.FFMPEG = FFMPEG_PATH
+        server.warm(server.SCAN_VERSION - 1)
+        self.assertFalse(server.CACHE_DIR.exists() and self.files_under(server.CACHE_DIR))
+        self.assertFalse(server.PREVIEW_DIR.exists() and self.files_under(server.PREVIEW_DIR))
 
 
 class Actions(GalleryTestCase):
