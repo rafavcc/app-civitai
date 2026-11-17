@@ -1,3 +1,6 @@
+import contextlib
+import email.utils
+import errno
 import json
 import os
 import shutil
@@ -5,13 +8,26 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import server  # noqa: E402
+
+# Redirect every on-disk path for the whole run, so even a background warm
+# thread that outlives a test's tearDown can never reach the real cache,
+# the real state file or the project's old thumbs folder.
+_RUN_TMP = Path(tempfile.mkdtemp(prefix="civit-tests-"))
+server.CACHE_DIR = _RUN_TMP / "thumbs"
+server.PREVIEW_DIR = _RUN_TMP / "previews"
+server.STATE_FILE = _RUN_TMP / "state.json"
+server.LEGACY_THUMBS = _RUN_TMP / "legacy-thumbs"
+import atexit  # noqa: E402
+atexit.register(shutil.rmtree, _RUN_TMP, ignore_errors=True)
 
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
@@ -66,16 +82,22 @@ class GalleryTestCase(unittest.TestCase):
         server.BASE = self.tmp
         server.ROOT = self.root
         # Keep tests away from the real state file and thumbnail cache
-        self._saved = (server.STATE_FILE, server.CACHE_DIR, server.FFMPEG)
+        self._saved = (server.STATE_FILE, server.CACHE_DIR, server.PREVIEW_DIR, server.FFMPEG, server.WARM, server.LEGACY_THUMBS)
+        server.WARM = False
+        server.LEGACY_THUMBS = self.tmp / "no-legacy"
         server.STATE_FILE = self.tmp / "state.json"
         server.CACHE_DIR = self.tmp / "cache"
+        server.PREVIEW_DIR = self.tmp / "previews"
+        server.FAILED.clear()
         server.scan()
         self.srv, self.base = start()
 
     def tearDown(self):
         self.srv.shutdown()
         self.srv.server_close()
-        server.STATE_FILE, server.CACHE_DIR, server.FFMPEG = self._saved
+        with server.LOCK:
+            server.SCAN_VERSION += 1  # stops any lingering warm thread before the real cache paths return
+        server.STATE_FILE, server.CACHE_DIR, server.PREVIEW_DIR, server.FFMPEG, server.WARM, server.LEGACY_THUMBS = self._saved
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def items(self, **params):
@@ -185,6 +207,419 @@ class MediaServing(GalleryTestCase):
         status, body, h = get(f"{self.base}/thumb/{self.first_id('real.mp4')}")
         self.assertEqual((status, h["Content-Type"]), (200, "image/jpeg"))
         self.assertTrue(body.startswith(b"\xff\xd8"))
+
+
+CACHE_ROOT_DEFAULT = server.CACHE_ROOT
+
+
+class Caching(GalleryTestCase):
+    def item(self, name):
+        return next(i for i in self.items()["items"] if i["name"] == name)
+
+    def test_items_carry_key(self):
+        for it in self.items()["items"]:
+            self.assertEqual(it["k"], server.file_key(it))
+
+    def test_keyed_media_is_immutable(self):
+        it = self.item("a.png")
+        _, _, h = get(f"{self.base}/media/{it['id']}?k={it['k']}")
+        self.assertIn("immutable", h["Cache-Control"])
+        self.assertIn("max-age=31536000", h["Cache-Control"])
+
+    def test_unkeyed_is_no_cache_and_stale_key_is_404_no_store(self):
+        it = self.item("a.png")
+        status, _, h = get(f"{self.base}/media/{it['id']}")
+        self.assertEqual((status, h["Cache-Control"]), (200, "no-cache"))
+        status, body, h = get(f"{self.base}/media/{it['id']}?k=1-1")
+        self.assertEqual((status, h["Cache-Control"]), (404, "no-store"))
+        self.assertNotEqual(body, PNG)
+
+    def test_stale_key_never_gets_304_or_immutable(self):
+        # Ids are list positions: after a rescan a stale page's id may point at another file.
+        for kind in ("media", "thumb", "preview"):
+            it = self.item("clip.mp4" if kind == "preview" else "a.png")
+            url = f"{self.base}/{kind}/{it['id']}?k=1-1"
+            lm = email.utils.formatdate(os.stat(self.root / it["name"]).st_mtime, usegmt=True)
+            for hdrs in ({}, {"If-Modified-Since": lm}):
+                status, body, h = get(url, headers=hdrs)
+                self.assertEqual((status, h["Cache-Control"]), (404, "no-store"), (kind, hdrs))
+                self.assertNotIn("immutable", h["Cache-Control"])
+                self.assertNotEqual(body, PNG)
+
+    def test_last_modified_and_304(self):
+        it = self.item("a.png")
+        url = f"{self.base}/media/{it['id']}"
+        _, _, h = get(url)
+        lm = h["Last-Modified"]
+        self.assertTrue(lm)
+        status, body, _ = get(url, headers={"If-Modified-Since": lm})
+        self.assertEqual((status, body), (304, b""))
+        older = email.utils.formatdate(os.stat(self.root / "a.png").st_mtime - 3600, usegmt=True)
+        status, _, _ = get(url, headers={"If-Modified-Since": older})
+        self.assertEqual(status, 200)
+
+    def test_range_request_ignores_if_modified_since(self):
+        it = self.item("a.png")
+        url = f"{self.base}/media/{it['id']}"
+        _, _, h = get(url)
+        status, _, _ = get(url, headers={"Range": "bytes=0-3", "If-Modified-Since": h["Last-Modified"]})
+        self.assertEqual(status, 206)
+
+    def test_touch_used_refreshes_only_old_files(self):
+        old, recent = self.tmp / "old", self.tmp / "recent"
+        for f in (old, recent):
+            f.write_bytes(b"x")
+        now = time.time()
+        os.utime(old, (now - 2 * 86400, now - 2 * 86400))
+        os.utime(recent, (now - 3600, now - 3600))
+        server.touch_used(old)
+        server.touch_used(recent)
+        self.assertLess(abs(old.stat().st_mtime - now), 60)
+        self.assertAlmostEqual(recent.stat().st_mtime, now - 3600, delta=1)
+
+    def test_sweep_deletes_only_stale_files_in_cache(self):
+        now = time.time()
+        stale = now - 31 * 86400
+        outside = self.tmp / "outside.bin"
+        outside.write_bytes(b"x")
+        os.utime(outside, (stale, stale))
+        made = {}
+        for d in (server.CACHE_DIR, server.PREVIEW_DIR):
+            (d / "ab").mkdir(parents=True)
+            old, fresh = d / "ab" / "old", d / "ab" / "fresh"
+            old.write_bytes(b"x")
+            fresh.write_bytes(b"x")
+            os.utime(old, (stale, stale))
+            made[d] = (old, fresh)
+        link = server.PREVIEW_DIR / "ab" / "link"
+        link.symlink_to(outside)
+        self.assertEqual(server.sweep_cache(), 2)
+        for old, fresh in made.values():
+            self.assertFalse(old.exists())
+            self.assertTrue(fresh.exists())
+        self.assertTrue(outside.exists())
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_failed_thumb_not_retried(self):
+        server.FFMPEG = shutil.which("ffmpeg")
+        (self.root / "bad.webp").write_bytes(b"not an image")
+        server.scan()
+        it = self.item("bad.webp")
+        real, calls = subprocess.run, []
+
+        def counting(*a, **kw):
+            calls.append(a)
+            return real(*a, **kw)
+
+        with self.assertLogs("gallery", "WARNING"), mock.patch.object(server.subprocess, "run", counting):
+            for _ in range(2):
+                status, body, h = get(f"{self.base}/thumb/{it['id']}?k={it['k']}")
+                self.assertEqual((status, body), (200, b"not an image"))
+                self.assertNotIn("immutable", h["Cache-Control"])
+        self.assertEqual(len(calls), 1)
+
+    def test_cache_root_is_outside_project(self):
+        self.assertEqual(CACHE_ROOT_DEFAULT.name, "civit-rv")
+        self.assertNotIn(server.APP_DIR.resolve(), CACHE_ROOT_DEFAULT.resolve().parents)
+
+
+FFMPEG_PATH = shutil.which("ffmpeg")
+FFPROBE_PATH = shutil.which("ffprobe")
+
+
+def make_video(path, seconds=10):
+    subprocess.run([FFMPEG_PATH, "-v", "error", "-y", "-f", "lavfi", "-i", f"testsrc=s=1280x720:d={seconds}:r=24",
+                    "-f", "lavfi", "-i", f"sine=d={seconds}", "-shortest", "-pix_fmt", "yuv420p", str(path)],
+                   check=True)
+
+
+class Previews(GalleryTestCase):
+    def item(self, name):
+        return next(i for i in self.items()["items"] if i["name"] == name)
+
+    def files_under(self, p):
+        return {f for f in Path(p).rglob("*") if f.is_file()}
+
+    def counting(self):
+        real, calls = subprocess.run, []
+
+        def counting(*a, **kw):
+            calls.append(a)
+            return real(*a, **kw)
+
+        return calls, mock.patch.object(server.subprocess, "run", counting)
+
+    @unittest.skipUnless(FFMPEG_PATH, "ffmpeg not installed")
+    def test_preview_generated_cached_and_small(self):
+        server.FFMPEG = FFMPEG_PATH
+        make_video(self.root / "clip.mp4")
+        server.scan()
+        it = self.item("clip.mp4")
+        calls, patch = self.counting()
+        with patch:
+            status, body, h = get(f"{self.base}/preview/{it['id']}?k={it['k']}")
+            self.assertEqual(status, 200)
+            self.assertEqual(h["Content-Type"], "video/mp4")
+            self.assertIn("immutable", h["Cache-Control"])
+            status2, body2, _ = get(f"{self.base}/preview/{it['id']}?k={it['k']}")
+        self.assertEqual((status2, body2), (200, body))
+        self.assertEqual(len(calls), 1)
+        clips = list(server.PREVIEW_DIR.rglob("*.mp4"))
+        self.assertEqual(len(clips), 1)
+        self.assertEqual(clips[0], server.preview_path(next(i for i in server.ITEMS if i["name"] == "clip.mp4")))
+        if FFPROBE_PATH:
+            out = subprocess.run([FFPROBE_PATH, "-v", "error", "-show_entries", "stream=codec_type,width",
+                                  "-show_entries", "format=duration", "-of", "json", str(clips[0])],
+                                 check=True, capture_output=True, text=True).stdout
+            info = json.loads(out)
+            video = [s for s in info["streams"] if s["codec_type"] == "video"]
+            self.assertEqual(video[0]["width"], 480)
+            self.assertFalse([s for s in info["streams"] if s["codec_type"] == "audio"])
+            self.assertLessEqual(float(info["format"]["duration"]), 6.1)
+
+    def test_preview_falls_back_to_original(self):
+        server.FFMPEG = None
+        it = self.item("clip.mp4")
+        status, body, h = get(f"{self.base}/preview/{it['id']}?k={it['k']}")
+        self.assertEqual((status, body), (200, b"x" * 1000))
+        self.assertNotIn("immutable", h["Cache-Control"])
+
+    def test_preview_404_for_images_and_moved(self):
+        self.assertEqual(get(f"{self.base}/preview/{self.item('a.png')['id']}")[0], 404)
+        it = self.item("clip.mp4")
+        server.ITEMS[it["id"]]["moved"] = True
+        self.assertEqual(get(f"{self.base}/preview/{it['id']}")[0], 404)
+        self.assertEqual(get(f"{self.base}/preview/999")[0], 404)
+
+    @unittest.skipUnless(FFMPEG_PATH, "ffmpeg not installed")
+    def test_corrupt_video_preview_fails_once(self):
+        server.FFMPEG = FFMPEG_PATH
+        it = self.item("clip.mp4")
+        calls, patch = self.counting()
+        with self.assertLogs("gallery", "WARNING"), patch:
+            for _ in range(2):
+                status, body, _ = get(f"{self.base}/preview/{it['id']}?k={it['k']}")
+                self.assertEqual((status, body), (200, b"x" * 1000))
+        self.assertEqual(len(calls), 1)
+
+    @unittest.skipUnless(FFMPEG_PATH, "ffmpeg not installed")
+    def test_nothing_written_in_media_folder(self):
+        server.FFMPEG = FFMPEG_PATH
+        make_video(self.root / "clip.mp4", 2)
+        (self.root / "bb.png").unlink()  # undecodable fixtures would log ffmpeg failures
+        (self.root / "a.png").unlink()
+        server.scan()
+        before = self.files_under(self.root)
+        for it in self.items()["items"]:
+            get(f"{self.base}/thumb/{it['id']}")
+            if it["kind"] == "video":
+                get(f"{self.base}/preview/{it['id']}")
+        self.assertTrue(self.files_under(server.CACHE_DIR))
+        self.assertEqual(self.files_under(self.root), before)
+
+    @unittest.skipUnless(FFMPEG_PATH, "ffmpeg not installed")
+    def test_warm_generates_thumbs_and_previews(self):
+        server.FFMPEG = FFMPEG_PATH
+        make_video(self.root / "clip.mp4", 2)
+        for png in self.root.glob("*.png"):  # the fixture PNGs are not decodable; use real images
+            subprocess.run([FFMPEG_PATH, "-v", "error", "-f", "lavfi", "-i", "color=blue:s=64x64",
+                            "-frames:v", "1", "-y", str(png)], check=True)
+        server.WARM = True
+        server.scan()
+        want_thumbs = len(server.ITEMS)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if (len(list(server.CACHE_DIR.rglob("*.jpg"))) >= want_thumbs
+                    and len(list(server.PREVIEW_DIR.rglob("*.mp4"))) >= 1):
+                break
+            time.sleep(0.1)
+        self.assertEqual(len(list(server.CACHE_DIR.rglob("*.jpg"))), want_thumbs)
+        self.assertEqual(len(list(server.PREVIEW_DIR.rglob("*.mp4"))), 1)
+
+    @unittest.skipUnless(FFMPEG_PATH, "ffmpeg not installed")
+    def test_warm_stops_on_folder_change(self):
+        server.FFMPEG = FFMPEG_PATH
+        server.warm(server.SCAN_VERSION - 1)
+        self.assertFalse(server.CACHE_DIR.exists() and self.files_under(server.CACHE_DIR))
+        self.assertFalse(server.PREVIEW_DIR.exists() and self.files_under(server.PREVIEW_DIR))
+
+
+class OnlineOnly(GalleryTestCase):
+    """Online-only iCloud files: give up after FETCH_WAIT, keep the download going, never touch ffmpeg/FAILED."""
+
+    def setUp(self):
+        super().setUp()
+        self.gate = threading.Event()
+        self.started = []
+        self.saved_wait = server.FETCH_WAIT
+        server.FETCH_WAIT = 0.2
+
+        def fake_read(path):
+            self.started.append(Path(path).name)
+            self.gate.wait(10)
+            self.online.discard(Path(path).name)  # the placeholder is now a real file
+
+        self.patches = [mock.patch.object(server, "is_online_only", lambda p: Path(p).name in self.online),
+                        mock.patch.object(server, "_read_fully", fake_read)]
+        self.online = {"a.png", "clip.mp4"}
+        server.FFMPEG = None  # restored by GalleryTestCase.tearDown; keeps background thumbnails quiet
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        self.gate.set()
+        for p in self.patches:
+            p.stop()
+        server.FETCH_WAIT = self.saved_wait
+        deadline = time.time() + 5
+        while server._FETCHING and time.time() < deadline:
+            time.sleep(0.01)
+        super().tearDown()
+
+    def item(self, name):
+        return next(i for i in self.items()["items"] if i["name"] == name)
+
+    def no_ffmpeg_calls(self):
+        stack = contextlib.ExitStack()
+        for name in ("make_thumb", "make_preview"):
+            stack.enter_context(mock.patch.object(server, name, side_effect=AssertionError(f"{name} must not run")))
+        stack.enter_context(mock.patch.object(server.subprocess, "run", side_effect=AssertionError("ffmpeg must not run")))
+        return stack
+
+    def test_thumb_times_out_with_503_and_keeps_fetching(self):
+        it = self.item("a.png")
+        with self.no_ffmpeg_calls():
+            status, body, h = get(f"{self.base}/thumb/{it['id']}")
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body), {"error": "downloading"})
+        self.assertEqual(h["Cache-Control"], "no-store")
+        self.assertEqual(h["Retry-After"], "10")
+        self.assertEqual(server.FAILED, set())
+        self.assertIn(str(self.root / "a.png"), server._FETCHING)
+        self.assertEqual(self.started, ["a.png"])
+        self.gate.set()
+        deadline = time.time() + 5
+        while server._FETCHING and time.time() < deadline:
+            time.sleep(0.01)
+        self.online.clear()  # iCloud finished: the file is a normal local file now
+        server.FFMPEG = None
+        status, body, _ = get(f"{self.base}/thumb/{it['id']}")
+        self.assertEqual((status, body), (200, PNG))
+
+    def test_thumb_served_when_fetch_finishes_in_time(self):
+        server.FETCH_WAIT = 5
+        it = self.item("a.png")
+        server.FFMPEG = None
+        threading.Timer(0.1, self.gate.set).start()
+        status, body, _ = get(f"{self.base}/thumb/{it['id']}")
+        self.assertEqual((status, body), (200, PNG))
+
+    def test_concurrent_requests_share_one_fetch(self):
+        it = self.item("a.png")
+        results = []
+        ts = [threading.Thread(target=lambda: results.append(get(f"{self.base}/thumb/{it['id']}")[0])) for _ in range(2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(results, [503, 503])
+        self.assertEqual(self.started, ["a.png"])
+
+    def test_preview_timeout_is_503_not_the_original(self):
+        it = self.item("clip.mp4")
+        with self.no_ffmpeg_calls():
+            status, body, h = get(f"{self.base}/preview/{it['id']}")
+        self.assertEqual(status, 503)
+        self.assertEqual((h["Cache-Control"], h["Retry-After"]), ("no-store", "10"))
+        self.assertEqual(server.FAILED, set())
+
+    def test_local_files_start_no_fetch(self):
+        self.online.clear()
+        server.FFMPEG = None
+        status, body, _ = get(f"{self.base}/thumb/{self.item('a.png')['id']}")
+        self.assertEqual((status, body), (200, PNG))
+        get(f"{self.base}/preview/{self.item('clip.mp4')['id']}")
+        self.assertEqual(self.started, [])
+        self.assertEqual(server._FETCHING, {})
+
+    def test_warm_skips_online_only_items(self):
+        self.online = {"a.png", "bb.png", "clip.mp4"}
+        with self.no_ffmpeg_calls():
+            server.warm(server.SCAN_VERSION)
+        self.assertEqual(self.started, [])
+        self.assertEqual(server._FETCHING, {})
+
+    def test_fetch_failure_still_releases_waiters(self):
+        def boom(path):
+            raise OSError("gone")
+        with mock.patch.object(server, "_read_fully", boom), self.assertLogs("gallery", "WARNING"):
+            ev = server.fetch(self.root / "a.png")
+            self.assertTrue(ev.wait(5))
+        deadline = time.time() + 5
+        while server._FETCHING and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(server._FETCHING, {})
+
+    def test_failed_fetch_is_503_not_ffmpeg_on_the_placeholder(self):
+        it = self.item("a.png")
+        with mock.patch.object(server, "_read_fully", side_effect=OSError("offline")), \
+                self.assertLogs("gallery", "WARNING"), self.no_ffmpeg_calls():
+            status, body, h = get(f"{self.base}/thumb/{it['id']}")
+        self.assertEqual((status, h["Retry-After"], h["Cache-Control"]), (503, "10", "no-store"))
+        self.assertEqual(server.FAILED, set())
+
+    def test_still_online_only_after_read_is_503(self):
+        it = self.item("clip.mp4")
+        with mock.patch.object(server, "_read_fully", lambda path: None), self.no_ffmpeg_calls():
+            status, _, h = get(f"{self.base}/preview/{it['id']}")
+        self.assertEqual((status, h["Retry-After"]), (503, "10"))
+
+    def test_no_thumbnail_after_fetch_if_folder_changed(self):
+        def read_then_switch(path):
+            with server.LOCK:
+                server.SCAN_VERSION += 1
+        with mock.patch.object(server, "_read_fully", read_then_switch), \
+                mock.patch.object(server, "make_thumb") as mt:
+            ev = server.fetch(self.root / "a.png")
+            self.assertTrue(ev.wait(5))
+            deadline = time.time() + 5
+            while server._FETCHING and time.time() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.2)
+        mt.assert_not_called()
+
+    def test_thread_start_failure_releases_entry(self):
+        with mock.patch.object(server.threading.Thread, "start", side_effect=RuntimeError("no threads")):
+            with self.assertRaises(RuntimeError):
+                server.fetch(self.root / "a.png")
+        self.assertEqual(server._FETCHING, {})
+
+
+class TransientFfmpegErrors(GalleryTestCase):
+    def item(self, name):
+        return next(i for i in self.items()["items"] if i["name"] == name)
+
+    def test_timeout_is_not_remembered_as_failed(self):
+        server.FFMPEG = "/usr/bin/ffmpeg"
+        it = self.item("clip.mp4")
+        boom = subprocess.TimeoutExpired("ffmpeg", 1)
+        with mock.patch.object(server.subprocess, "run", side_effect=boom), self.assertLogs("gallery", "WARNING"):
+            self.assertIsNone(server.make_thumb(it))
+            self.assertIsNone(server.make_preview(it))
+        self.assertEqual(server.FAILED, set())
+
+    def test_real_ffmpeg_error_is_remembered_as_failed(self):
+        server.FFMPEG = "/usr/bin/ffmpeg"
+        it = self.item("clip.mp4")
+        boom = subprocess.CalledProcessError(1, "ffmpeg", stderr=b"bad")
+        with mock.patch.object(server.subprocess, "run", side_effect=boom), self.assertLogs("gallery", "WARNING"):
+            server.make_thumb(it)
+            server.make_preview(it)
+        self.assertEqual(len(server.FAILED), 2)
+
+    def test_is_online_only_false_for_real_local_file(self):
+        self.assertFalse(server.is_online_only(self.root / "a.png"))
+        self.assertFalse(server.is_online_only(self.root / "missing.png"))
 
 
 class Actions(GalleryTestCase):
@@ -337,6 +772,239 @@ class Actions(GalleryTestCase):
         self.assertEqual(server.load_state()["folder"], str(self.tmp / "other"))
         status, r = jget(f"{self.base}/api/folder?path=")
         self.assertEqual((status, r["path"]), (200, ""))
+
+
+class Report(GalleryTestCase):
+    def test_cache_stats_counts_files_and_bytes(self):
+        d = self.tmp / "st"
+        (d / "aa").mkdir(parents=True)
+        (d / "bb").mkdir()
+        (d / "aa" / "1.jpg").write_bytes(b"abc")
+        (d / "bb" / "2.jpg").write_bytes(b"12345")
+        os.utime(d / "aa" / "1.jpg", (5000, 5000))
+        os.utime(d / "bb" / "2.jpg", (9000, 9000))
+        self.assertEqual(server.cache_stats(d), {"files": 2, "bytes": 8, "oldest_use": 5000})
+
+    def test_cache_stats_skips_tmp_and_symlinks(self):
+        d = self.tmp / "st"
+        (d / "aa").mkdir(parents=True)
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "big.jpg").write_bytes(b"z" * 100)
+        (d / "aa" / "1.jpg").write_bytes(b"abc")
+        (d / "aa" / "x.tmp.123").write_bytes(b"tmp")
+        os.symlink(outside / "big.jpg", d / "aa" / "link.jpg")
+        os.symlink(outside, d / "linkdir")
+        self.assertEqual(server.cache_stats(d)["files"], 1)
+        self.assertEqual(server.cache_stats(d)["bytes"], 3)
+
+    def test_cache_stats_missing_dir_is_none(self):
+        self.assertIsNone(server.cache_stats(self.tmp / "nope"))
+
+    def report(self):
+        status, data = jget(f"{self.base}/api/report")
+        self.assertEqual(status, 200)
+        return data
+
+    def test_report_shape(self):
+        r = self.report()
+        for k in ("thumbs", "previews", "legacy_thumbs", "failed", "folder", "max_age_days"):
+            self.assertIn(k, r)
+        self.assertEqual(r["max_age_days"], 30)
+        self.assertIsNone(r["legacy_thumbs"])
+        self.assertEqual(r["failed"], {"thumb": 0, "preview": 0})
+        self.assertEqual(r["folder"], {"images": 2, "videos": 1, "bytes": len(PNG) * 3 + 1000, "videos_without_clip": 1})
+        _, _, h = get(f"{self.base}/api/report")
+        self.assertEqual(h["Cache-Control"], "no-cache")
+
+    def test_report_counts_clips_and_failed(self):
+        video = next(i for i in server.ITEMS if i["kind"] == "video")
+        p = server.preview_path(video)
+        p.parent.mkdir(parents=True)
+        p.write_bytes(b"clip")
+        server.FAILED.update({"preview:x", "thumb:y"})
+        r = self.report()
+        self.assertEqual(r["folder"]["videos_without_clip"], 0)
+        self.assertEqual(r["failed"], {"thumb": 1, "preview": 1})
+        self.assertEqual(r["previews"]["files"], 1)
+
+    def test_report_writes_nothing(self):
+        def snap():
+            out = {}
+            for base in (self.root, server.CACHE_DIR, server.PREVIEW_DIR):
+                for dp, dn, fn in os.walk(base):
+                    for n in dn + fn:
+                        f = os.path.join(dp, n)
+                        out[f] = os.lstat(f).st_mtime_ns
+            return out
+        before = snap()
+        self.report()
+        self.assertEqual(snap(), before)
+
+
+class Rename(GalleryTestCase):
+    def post(self, body):
+        return post_json(f"{self.base}/api/rename", body)
+
+    def id_of(self, name):
+        return next(i["id"] for i in self.items()["items"] if i["name"] == name)
+
+    def ver(self):
+        return self.items()["ver"]
+
+    def rename(self, old, name):
+        return self.post({"id": self.id_of(old), "ver": self.ver(), "name": name})
+
+    def test_rename_keeps_extension_and_id(self):
+        aid = self.id_of("a.png")
+        status, r = self.post({"id": aid, "ver": self.ver(), "name": "new"})
+        self.assertEqual((status, r["ok"], r["id"], r["name"], r["path"]), (200, True, aid, "new.png", "new.png"))
+        self.assertFalse((self.root / "a.png").exists())
+        self.assertEqual((self.root / "new.png").read_bytes(), PNG)
+        it = next(i for i in self.items()["items"] if i["id"] == aid)
+        self.assertEqual(it["path"], "new.png")
+        status, body, _ = get(f"{self.base}/media/{aid}")
+        self.assertEqual((status, body), (200, PNG))
+
+    def test_conflict_is_case_insensitive(self):
+        status, r = self.rename("a.png", "BB")
+        self.assertEqual((status, r["error"]), (400, "A file named BB.png already exists"))
+        self.assertTrue((self.root / "a.png").exists())
+        self.assertTrue((self.root / "bb.png").exists())
+
+    def test_conflict_with_non_media_entries(self):
+        (self.root / "x.png").mkdir()
+        status, r = self.rename("a.png", "X")
+        self.assertEqual((status, r["error"]), (400, "A file named X.png already exists"))
+        self.assertTrue((self.root / "a.png").exists())
+        status, r = self.rename("a.png", ".hidden")
+        self.assertEqual((status, r["error"]), (400, "Name can't start with a dot"))
+
+    def test_case_only_change_allowed(self):
+        status, r = self.rename("a.png", "A")
+        self.assertEqual((status, r["name"]), (200, "A.png"))
+        self.assertIn("A.png", os.listdir(self.root))
+        self.assertNotIn("a.png", os.listdir(self.root))
+
+    def test_file_appearing_before_rename_is_not_overwritten(self):
+        real = os.scandir
+
+        def racy(path):
+            entries = list(real(path))
+            (self.root / "new.png").write_bytes(b"INTRUDER")  # created after the conflict check's listing
+            return contextlib.nullcontext(iter(entries))
+
+        aid, v = self.id_of("a.png"), self.ver()
+        with mock.patch("server.os.scandir", racy):
+            status, r = self.post({"id": aid, "ver": v, "name": "new"})
+        self.assertEqual((status, r["error"]), (400, "A file named new.png already exists"))
+        self.assertEqual((self.root / "new.png").read_bytes(), b"INTRUDER")
+        self.assertEqual((self.root / "a.png").read_bytes(), PNG)
+
+    def test_generic_oserror_is_400(self):
+        with mock.patch("server.os.link", side_effect=OSError(errno.EIO, "Input/output error")):
+            with self.assertLogs("gallery", level="WARNING"):
+                status, r = self.rename("a.png", "n")
+        self.assertEqual(status, 400)
+        self.assertTrue(r["error"].startswith("Could not rename file"))
+        self.assertTrue((self.root / "a.png").exists())
+        self.assertFalse((self.root / "n.png").exists())
+
+    def test_link_unsupported_falls_back_to_rename(self):
+        with mock.patch("server.os.link", side_effect=PermissionError(errno.EPERM, "nope")):
+            status, r = self.rename("a.png", "n")
+            self.assertEqual((status, r["name"]), (200, "n.png"))
+            (self.root / "bb.png").rename(self.root / "keep.png")  # fallback still refuses an existing target
+            status, r = self.rename("n.png", "keep")
+        self.assertEqual((status, r["error"]), (400, "A file named keep.png already exists"))
+        self.assertTrue((self.root / "n.png").exists())
+
+    def test_unlink_failure_leaves_a_single_name(self):
+        real = os.unlink
+        src = str(self.root / "a.png")
+
+        def flaky(p, *a, **k):
+            if str(p) == src:
+                raise OSError(errno.EACCES, "Permission denied")
+            return real(p, *a, **k)
+
+        with mock.patch("server.os.unlink", flaky):
+            with self.assertLogs("gallery", level="WARNING"):
+                status, r = self.rename("a.png", "n")
+        self.assertEqual(status, 400)
+        self.assertTrue((self.root / "a.png").exists())
+        self.assertFalse((self.root / "n.png").exists())
+
+    def test_same_name_is_noop(self):
+        status, r = self.rename("a.png", "a")
+        self.assertEqual((status, r["name"]), (200, "a.png"))
+        self.assertEqual((self.root / "a.png").stat().st_mtime, 1000)
+
+    def test_invalid_names(self):
+        bad = "Name can't contain / \\ : * ? \" < > |"
+        cases = [("", "Name can't be empty"), ("   ", "Name can't be empty"),
+                 ("a/b", bad), ("a:b", bad), ("a\x01", bad), ("x" * 256, "Name is too long")]
+        for name, msg in cases:
+            status, r = self.rename("a.png", name)
+            self.assertEqual((status, r["error"]), (400, msg), repr(name))
+        self.assertTrue((self.root / "a.png").exists())
+
+    def test_bad_body_shape_is_400(self):
+        v = self.ver()
+        for body in ({"ver": v, "name": "n"}, {"id": "1", "ver": v, "name": "n"},
+                     {"id": 0, "name": "n"}, {"id": 0, "ver": v, "name": 5}, {"id": 0, "ver": v}):
+            self.assertEqual(self.post(body)[0], 400, body)
+
+    def test_stale_ver_409(self):
+        aid = self.id_of("a.png")
+        status, r = self.post({"id": aid, "ver": self.ver() - 1, "name": "new"})
+        self.assertEqual((status, r["error"]), (409, "Folder changed \u2014 reload to continue"))
+        self.assertTrue((self.root / "a.png").exists())
+
+    def test_requires_json_and_same_origin(self):
+        body = json.dumps({"id": self.id_of("a.png"), "ver": self.ver(), "name": "new"}).encode()
+        for headers, want in (({"Content-Type": "text/plain"}, 415),
+                              ({"Content-Type": "application/json", "Origin": "http://evil.example"}, 403)):
+            req = urllib.request.Request(f"{self.base}/api/rename", data=body, method="POST", headers=headers)
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(req)
+            self.assertEqual(cm.exception.code, want)
+            cm.exception.close()
+        self.assertTrue((self.root / "a.png").exists())
+
+    def test_moved_item_404(self):
+        aid = self.id_of("a.png")
+        status, _ = post_json(f"{self.base}/api/move", {"ids": [aid], "ver": self.ver(), "dest": "other"})
+        self.assertEqual(status, 200)
+        status, r = self.post({"id": aid, "ver": self.ver(), "name": "new"})
+        self.assertEqual((status, r["error"]), (404, "File not found"))
+
+    def test_symlink_refused(self):
+        (self.root / "link.png").symlink_to(self.root / "a.png")
+        server.scan()
+        status, r = self.rename("link.png", "other")
+        self.assertEqual((status, r["error"]), (400, "Symlinks are not supported"))
+        self.assertTrue((self.root / "link.png").is_symlink())
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_cached_thumb_follows_rename(self):
+        server.FFMPEG = shutil.which("ffmpeg")
+        img = self.tmp / "big.jpg"
+        subprocess.run([server.FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=red:s=1600x900",
+                        "-frames:v", "1", str(img)], check=True)
+        shutil.copy(img, self.root / "big.jpg")
+        server.scan()
+        tid = self.id_of("big.jpg")
+        get(f"{self.base}/thumb/{tid}")
+        old = server.thumb_path(server.ITEMS[tid])
+        self.assertTrue(old.exists())
+        status, _ = self.post({"id": tid, "ver": self.ver(), "name": "renamed"})
+        self.assertEqual(status, 200)
+        self.assertFalse(old.exists())
+        self.assertTrue(server.thumb_path(server.ITEMS[tid]).exists())
+        with mock.patch.object(server.subprocess, "run", side_effect=AssertionError("ffmpeg re-run")):
+            status, _, _ = get(f"{self.base}/thumb/{tid}")
+        self.assertEqual(status, 200)
 
 
 class Hardening(GalleryTestCase):

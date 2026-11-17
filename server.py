@@ -4,6 +4,8 @@
 Usage: python3 server.py /path/to/media   (listens on 0.0.0.0:8765)
 """
 import argparse
+import email.utils
+import errno
 import hashlib
 import json
 import logging
@@ -13,6 +15,7 @@ import random
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -26,7 +29,15 @@ VIDEO_EXT = {".mp4", ".webm", ".mov", ".m4v", ".mkv"}
 APP_DIR = Path(__file__).parent
 STATIC_DIR = APP_DIR / "static"
 STATE_FILE = APP_DIR / "state.json"
-CACHE_DIR = APP_DIR / ".cache" / "thumbs"
+# Outside the project so a sync/backup of the app folder never carries the caches along
+CACHE_ROOT = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "civit-rv"
+CACHE_DIR = CACHE_ROOT / "thumbs"
+PREVIEW_DIR = CACHE_ROOT / "previews"
+# Pre-move thumbnail folder inside the project; only read, to remind the user to delete it
+LEGACY_THUMBS = APP_DIR.resolve() / ".cache" / "thumbs"
+CACHE_MAX_AGE = 30 * 86400  # cached files unused for this long are swept
+TOUCH_EVERY = 86400  # refresh a file's last-use time at most this often
+SWEEP_EVERY = 86400
 HOST = "0.0.0.0"
 PORT = 8765
 THUMB_WIDTH = 512
@@ -41,7 +52,15 @@ LOCK = threading.Lock()
 SCAN_VERSION = time.time_ns() // 1000
 FFMPEG = shutil.which("ffmpeg")
 THUMB_SLOTS = threading.Semaphore(4)  # bound concurrent ffmpeg processes
+PREVIEW_SLOTS = threading.Semaphore(2)  # clip encodes are heavy; keep them few
+WARM = True  # pre-generate thumbnails and clips in the background after a scan
+FAILED: set[str] = set()  # "kind:cache_key" whose generation failed in this process; not retried
+FETCH_SLOTS = threading.Semaphore(4)  # bound concurrent whole-file reads of online-only files
+FETCH_WAIT = 10  # seconds a request waits for an online-only file before answering 503
+_FETCHING: dict[str, threading.Event] = {}  # source path -> Event set when its background read ends
+_FETCH_LOCK = threading.Lock()
 log = logging.getLogger("gallery")
+LINK_UNSUPPORTED = {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EMLINK}
 
 
 def load_state():
@@ -66,17 +85,96 @@ def get_item(idx):
         return ITEMS[idx] if 0 <= idx < len(ITEMS) else None
 
 
+def file_key(item):
+    return f"{int(item['mtime'] * 1000)}-{item['size']}"
+
+
+def cache_key(item):
+    return hashlib.sha1(f"{ROOT}|{item['path']}|{item['mtime']}|{item['size']}".encode()).hexdigest()
+
+
 def thumb_path(item):
-    key = hashlib.sha1(f"{ROOT}|{item['path']}|{item['mtime']}|{item['size']}".encode()).hexdigest()
+    key = cache_key(item)
     return CACHE_DIR / key[:2] / f"{key}.jpg"
 
 
+def preview_path(item):
+    key = cache_key(item)
+    return PREVIEW_DIR / key[:2] / f"{key}.mp4"
+
+
 def drop_thumb(item):
-    # A deleted file's cached thumbnail would otherwise linger forever
+    # A deleted file's cached thumbnail and preview would otherwise linger until swept
+    for p in (thumb_path(item), preview_path(item)):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def validate_name(stem, suffix):
+    """Returns the full new file name for a rename, or raises HttpError(400) with the reason."""
+    stem = stem.strip()
+    if not stem:
+        raise HttpError(400, "Name can't be empty")
+    if re.search(r'[/\\:*?"<>|\x00-\x1f]', stem):
+        raise HttpError(400, 'Name can\'t contain / \\ : * ? " < > |')
+    if stem.startswith("."):
+        raise HttpError(400, "Name can't start with a dot")
+    name = stem + suffix
+    if len(name.encode("utf-8", "surrogatepass")) > 255:
+        raise HttpError(400, "Name is too long")
+    return name
+
+
+def touch_used(path):
+    """Marks a cached file as used now, at most once per TOUCH_EVERY."""
     try:
-        thumb_path(item).unlink(missing_ok=True)
+        now = time.time()
+        if now - path.stat().st_mtime > TOUCH_EVERY:
+            os.utime(path, (now, now))
     except OSError:
         pass
+
+
+def sweep_cache(now=None):
+    """Deletes cached files unused for CACHE_MAX_AGE. Never follows symlinks. Returns the count."""
+    cutoff = (time.time() if now is None else now) - CACHE_MAX_AGE
+    removed = 0
+    for base in (CACHE_DIR, PREVIEW_DIR):
+        for dirpath, _dirs, files in os.walk(base, followlinks=False):
+            for name in files:
+                f = os.path.join(dirpath, name)
+                try:
+                    st = os.lstat(f)
+                    if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                        os.unlink(f)
+                        removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
+def cache_stats(d):
+    """File count, bytes and oldest mtime under d (regular files only, no symlinks, no *.tmp.*). None if d is missing."""
+    if not os.path.isdir(d):
+        return None
+    files = total = 0
+    oldest = None
+    for dirpath, _dirs, names in os.walk(d, followlinks=False):
+        for name in names:
+            if ".tmp." in name:
+                continue
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            files += 1
+            total += st.st_size
+            oldest = st.st_mtime if oldest is None else min(oldest, st.st_mtime)
+    return {"files": files, "bytes": total, "oldest_use": oldest}
 
 
 def parse_ids(body):
@@ -92,6 +190,65 @@ def parse_ids(body):
     return ids
 
 
+def is_online_only(path):
+    """True for an iCloud placeholder (size known, no blocks on disk). os.stat does not trigger a download."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return st.st_size > 0 and st.st_blocks == 0
+
+
+def _read_fully(path):
+    """Reads the whole file and discards it: this is what makes iCloud download it."""
+    with open(path, "rb") as f:
+        while f.read(1 << 20):
+            pass
+
+
+def _fetch_worker(path, key, event, root, version):
+    try:
+        with FETCH_SLOTS:
+            _read_fully(path)
+        ok = True
+    except Exception as e:
+        ok = False
+        log.warning("Download failed for %s: %s", path, e)
+    finally:
+        event.set()
+        with _FETCH_LOCK:
+            _FETCHING.pop(key, None)
+    if ok:
+        try:
+            with LOCK:  # same pattern as warm(): only act if the folder is still the one fetch() saw
+                items = list(ITEMS) if SCAN_VERSION == version else []
+            for item in items:
+                if not item.get("moved") and str(root / item["path"]) == key:
+                    if SCAN_VERSION == version:
+                        make_thumb(item)
+                    break
+        except Exception:
+            log.exception("Thumbnail after download failed for %s", path)
+
+
+def fetch(path):
+    """Starts (once per path) a background read of an online-only file; returns an Event set when it ends."""
+    key = str(path)
+    with LOCK:
+        root, version = ROOT, SCAN_VERSION
+    with _FETCH_LOCK:
+        event = _FETCHING.get(key)
+        if event is None:
+            event = _FETCHING[key] = threading.Event()
+            try:
+                threading.Thread(target=_fetch_worker, args=(path, key, event, root, version), daemon=True).start()
+            except BaseException:
+                del _FETCHING[key]
+                event.set()
+                raise
+    return event
+
+
 def make_thumb(item):
     """Returns the cached thumbnail path (creating it with ffmpeg if needed), or None on failure."""
     if not FFMPEG:
@@ -99,6 +256,9 @@ def make_thumb(item):
     out = thumb_path(item)
     if out.is_file():
         return out
+    fail_key = f"thumb:{cache_key(item)}"
+    if fail_key in FAILED:
+        return None
     src = ROOT / item["path"]
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(f"{out.name}.{threading.get_ident()}.tmp.jpg")
@@ -110,16 +270,83 @@ def make_thumb(item):
     with THUMB_SLOTS:
         if out.is_file():  # another request finished it while we waited
             return out
+        if fail_key in FAILED:
+            return None
         try:
             subprocess.run(cmd, check=True, timeout=60, stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             os.replace(tmp, out)
             return out
+        except subprocess.TimeoutExpired:
+            log.warning("Thumbnail timed out for %s (not remembered as failed)", item["path"])
+            return None
         except (subprocess.SubprocessError, OSError) as e:
+            FAILED.add(fail_key)
             log.warning("Thumbnail failed for %s: %s", item["path"], getattr(e, "stderr", e))
             return None
         finally:
             tmp.unlink(missing_ok=True)
+
+
+def make_preview(item, wait=True):
+    """Returns the cached 6 s silent preview clip path (encoding it if needed), or None on failure.
+    With wait=False it gives up (None) instead of queueing when both encode slots are busy."""
+    if not FFMPEG:
+        return None
+    out = preview_path(item)
+    if out.is_file():
+        return out
+    fail_key = f"preview:{cache_key(item)}"
+    if fail_key in FAILED:
+        return None
+    src = ROOT / item["path"]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(f"{out.name}.{threading.get_ident()}.tmp.mp4")
+    cmd = [FFMPEG, "-v", "error", "-y", "-ss", "0.1", "-i", str(src), "-t", "6", "-an",
+           "-vf", "fps=24,scale='min(480,iw)':-2", "-c:v", "libx264", "-preset", "veryfast",
+           "-crf", "30", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(tmp)]
+    if not PREVIEW_SLOTS.acquire(blocking=wait):
+        return None
+    try:
+        if out.is_file():  # another request finished it while we waited
+            return out
+        if fail_key in FAILED:
+            return None
+        try:
+            subprocess.run(cmd, check=True, timeout=120, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            os.replace(tmp, out)
+            return out
+        except subprocess.TimeoutExpired:
+            log.warning("Preview timed out for %s (not remembered as failed)", item["path"])
+            return None
+        except (subprocess.SubprocessError, OSError) as e:
+            FAILED.add(fail_key)
+            log.warning("Preview failed for %s: %s", item["path"], getattr(e, "stderr", e))
+            return None
+        finally:
+            tmp.unlink(missing_ok=True)
+    finally:
+        PREVIEW_SLOTS.release()
+
+
+def warm(version):
+    """Pre-generates thumbnails and clips for the current items, newest first, until the folder changes."""
+    with LOCK:
+        items = list(ITEMS)
+    for item in items:
+        if SCAN_VERSION != version:
+            return
+        if item.get("moved"):
+            continue
+        if is_online_only(ROOT / item["path"]):  # never start a download from the warm-up
+            continue
+        try:
+            make_thumb(item)
+            if item["kind"] == "video" and SCAN_VERSION == version:
+                make_preview(item, wait=False)  # never queue ahead of on-demand clip requests
+        except Exception:
+            log.exception("Warm-up failed for %s", item.get("path"))
 
 
 def kind_of(name):
@@ -170,7 +397,10 @@ def scan(root=None):
         ROOT = root
         ITEMS[:] = items
         SCAN_VERSION += 1
+        version = SCAN_VERSION
     log.info("Scanned %s: %d files", root, len(items))
+    if WARM and FFMPEG:
+        threading.Thread(target=warm, args=(version,), daemon=True).start()
     return len(items)
 
 
@@ -188,10 +418,14 @@ class Handler(BaseHTTPRequestHandler):
         if not self.path.startswith("/media/"):
             log.info("%s %s", self.address_string(), fmt % args)
 
-    def send_json(self, obj, status=200):
+    def send_json(self, obj, status=200, no_store=False, headers=None):
         body = json.dumps(obj).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        if no_store:
+            self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -219,10 +453,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.list_folders(q.get("path", [None])[0])
             if url.path == "/api/rescan":
                 return self.send_json({"count": scan()})
+            if url.path == "/api/report":
+                return self.api_report()
             if url.path.startswith("/media/"):
-                return self.media(int(url.path[7:]))
+                return self.media(int(url.path[7:]), q)
             if url.path.startswith("/thumb/"):
-                return self.thumb(int(url.path[7:]))
+                return self.thumb(int(url.path[7:]), q)
+            if url.path.startswith("/preview/"):
+                return self.preview(int(url.path[9:]), q)
         except (BrokenPipeError, ConnectionResetError):
             return
         except ValueError:  # non-numeric ids and similar malformed input
@@ -239,6 +477,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.move_items(self.read_json_body())
             if url.path == "/api/delete":
                 return self.delete_items(self.read_json_body())
+            if url.path == "/api/rename":
+                return self.rename_item(self.read_json_body())
         except (BrokenPipeError, ConnectionResetError):
             return
         except HttpError as e:
@@ -372,6 +612,71 @@ class Handler(BaseHTTPRequestHandler):
 
         self.batch(body, None, one)
 
+    def rename_item(self, body):
+        idx, ver, stem = body.get("id"), body.get("ver"), body.get("name")
+        if any(not isinstance(v, int) or isinstance(v, bool) for v in (idx, ver)) or not isinstance(stem, str):
+            raise HttpError(400, "id and ver must be integers and name a string")
+        with LOCK:
+            if ver != SCAN_VERSION:
+                return self.send_json({"error": "Folder changed — reload to continue"}, 409)
+            item = ITEMS[idx] if 0 <= idx < len(ITEMS) else None
+            if item is None or item.get("moved"):
+                return self.send_json({"error": "File not found"}, 404)
+            link = ROOT / item["path"]
+            if link.is_symlink():
+                return self.send_json({"error": "Symlinks are not supported"}, 400)
+            src = link.resolve()
+            if ROOT not in src.parents or not src.is_file():
+                return self.send_json({"error": "File not found"}, 404)
+            new_name = validate_name(stem, Path(item["name"]).suffix)
+            if new_name == item["name"]:
+                return self.send_json({"ok": True, "id": idx, "name": item["name"], "path": item["path"]})
+            with os.scandir(src.parent) as it:
+                for entry in it:
+                    if entry.name != item["name"] and entry.name.casefold() == new_name.casefold():
+                        raise HttpError(400, f"A file named {new_name} already exists")
+            target = src.parent / new_name
+            old_cache = (thumb_path(item), preview_path(item))
+            exists = HttpError(400, f"A file named {new_name} already exists")
+            try:
+                if new_name.casefold() == item["name"].casefold():
+                    os.rename(src, target)  # case-only change: the "target" is the file itself
+                else:
+                    # os.rename would silently replace a file created since the check above; os.link refuses
+                    try:
+                        os.link(src, target)
+                    except FileExistsError:
+                        raise exists
+                    except OSError as e:
+                        if e.errno not in LINK_UNSUPPORTED:
+                            raise
+                        if os.path.lexists(target):
+                            raise exists
+                        os.rename(src, target)
+                    else:
+                        try:
+                            os.unlink(src)
+                        except OSError:
+                            os.unlink(target)  # never leave two names for one file
+                            raise
+            except HttpError:
+                raise
+            except OSError as e:
+                log.warning("Rename failed for %s: %s", item["path"], e)
+                raise HttpError(400, f"Could not rename file: {e.strerror or e}")
+            old_path = item["path"]
+            item["name"] = new_name
+            item["path"] = target.relative_to(ROOT).as_posix()
+            for old, new in zip(old_cache, (thumb_path(item), preview_path(item))):
+                try:
+                    new.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(old, new)
+                except OSError:
+                    pass
+            result = {"ok": True, "id": idx, "name": item["name"], "path": item["path"]}
+        log.info("Renamed %s -> %s", old_path, result["path"])
+        self.send_json(result)
+
     def set_folder(self, path):
         new = Path(path)
         count = scan(new)  # swaps ROOT/ITEMS/SCAN_VERSION atomically once the walk is done
@@ -384,6 +689,30 @@ class Handler(BaseHTTPRequestHandler):
         if new is None:
             return self.send_json({"error": "Invalid folder"}, 400)
         self.set_folder(new)
+
+    def api_report(self):
+        with LOCK:
+            items = [it for it in ITEMS if not it.get("moved")]
+        videos = [it for it in items if it["kind"] == "video"]
+        body = json.dumps({
+            "thumbs": cache_stats(CACHE_DIR),
+            "previews": cache_stats(PREVIEW_DIR),
+            "legacy_thumbs": cache_stats(LEGACY_THUMBS),
+            "failed": {k: sum(1 for f in list(FAILED) if f.startswith(k + ":")) for k in ("thumb", "preview")},
+            "folder": {
+                "images": len(items) - len(videos),
+                "videos": len(videos),
+                "bytes": sum(it["size"] for it in items),
+                "videos_without_clip": sum(1 for it in videos if not preview_path(it).exists()),
+            },
+            "max_age_days": CACHE_MAX_AGE // 86400,
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def api_items(self, q):
         offset = max(0, int(q.get("offset", ["0"])[0]))
@@ -411,36 +740,93 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({
             "total": len(indexed),
             "ver": ver,
-            "items": [{"id": i, **it} for i, it in page],
+            "items": [{"id": i, **it, "k": file_key(it)} for i, it in page],
         })
 
-    def media(self, idx):
-        item = get_item(idx)
-        if item is None or item.get("moved"):
-            return self.send_json({"error": "not found"}, 404)
-        full = (ROOT / item["path"]).resolve()
-        if ROOT not in full.parents:
-            return self.send_json({"error": "forbidden"}, 403)
-        self.send_file(full, cache=True)
+    def stale_key(self, item, q):
+        """Ids are list positions that change on rescan, so a `k` that is not this item's key belongs to another
+        file: answer 404 no-store (never its bytes, which a cache could pin) and return True."""
+        if "k" in q and q["k"][0] != file_key(item):
+            self.send_json({"error": "stale"}, 404, no_store=True)
+            return True
+        return False
 
-    def thumb(self, idx):
+    def media(self, idx, q):
         item = get_item(idx)
         if item is None or item.get("moved"):
             return self.send_json({"error": "not found"}, 404)
         full = (ROOT / item["path"]).resolve()
         if ROOT not in full.parents:
             return self.send_json({"error": "forbidden"}, 403)
+        if self.stale_key(item, q):
+            return
+        self.send_file(full, immutable="k" in q)
+
+    def still_downloading(self, full):
+        """For an online-only file: starts its download and waits up to FETCH_WAIT. If it is not there yet,
+        answers 503 (the download keeps going) and returns True."""
+        # a finished fetch is not enough: it may have failed or the file been evicted again
+        if is_online_only(full) and not (fetch(full).wait(FETCH_WAIT) and not is_online_only(full)):
+            self.send_json({"error": "downloading"}, 503, no_store=True, headers={"Retry-After": "10"})
+            return True
+        return False
+
+    def thumb(self, idx, q):
+        item = get_item(idx)
+        if item is None or item.get("moved"):
+            return self.send_json({"error": "not found"}, 404)
+        full = (ROOT / item["path"]).resolve()
+        if ROOT not in full.parents:
+            return self.send_json({"error": "forbidden"}, 403)
+        if self.stale_key(item, q):
+            return
+        keyed = "k" in q
+        if not thumb_path(item).is_file() and self.still_downloading(full):
+            return
         t = make_thumb(item)
         if t:
-            return self.send_file(t, cache=True)
+            touch_used(t)
+            return self.send_file(t, immutable=keyed)
         if item["kind"] == "image":  # no ffmpeg or it failed: the original still works
-            return self.send_file(full, cache=True)
+            return self.send_file(full)  # not immutable: a later thumbnail must not be hidden
         self.send_json({"error": "no thumbnail"}, 404)
 
-    def send_file(self, path: Path, cache=False):
+    def preview(self, idx, q):
+        item = get_item(idx)
+        if item is None or item.get("moved") or item["kind"] != "video":
+            return self.send_json({"error": "not found"}, 404)
+        full = (ROOT / item["path"]).resolve()
+        if ROOT not in full.parents:
+            return self.send_json({"error": "forbidden"}, 403)
+        if self.stale_key(item, q):
+            return
+        keyed = "k" in q
+        if not preview_path(item).is_file() and self.still_downloading(full):
+            return
+        clip = make_preview(item)
+        if clip:
+            touch_used(clip)
+            return self.send_file(clip, immutable=keyed)
+        self.send_file(full)  # no ffmpeg or it failed: the original; not immutable, a clip may come later
+
+    def send_file(self, path: Path, cache=False, immutable=False):
         if not path.is_file():
             return self.send_json({"error": "not found"}, 404)
-        size = path.stat().st_size
+        st = path.stat()
+        size = st.st_size
+        last_mod = email.utils.formatdate(int(st.st_mtime), usegmt=True)
+        ims = self.headers.get("If-Modified-Since")
+        if ims and not self.headers.get("Range"):
+            try:
+                if email.utils.parsedate_to_datetime(ims).timestamp() >= int(st.st_mtime):
+                    self.send_response(304)
+                    self.send_header("Last-Modified", last_mod)
+                    self.send_header("Cache-Control", cache_control(cache, immutable))
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+            except (TypeError, ValueError):
+                pass
         ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         start, end = 0, size - 1
         status = 200
@@ -464,7 +850,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
-        self.send_header("Cache-Control", "public, max-age=3600" if cache else "no-cache")
+        self.send_header("Last-Modified", last_mod)
+        self.send_header("Cache-Control", cache_control(cache, immutable))
         if status == 206:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
@@ -477,6 +864,21 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
+
+
+def cache_control(cache, immutable):
+    if immutable:
+        return "public, max-age=31536000, immutable"
+    return "public, max-age=3600" if cache else "no-cache"
+
+
+def sweep_loop():
+    while True:
+        time.sleep(SWEEP_EVERY)
+        try:
+            log.info("Cache sweep removed %d stale files", sweep_cache())
+        except Exception:
+            log.exception("Cache sweep failed")
 
 
 def display_host(host):
@@ -523,6 +925,8 @@ def main():
     t = time.perf_counter()
     n = scan()
     log.info("Indexed %d files in %.1fs", n, time.perf_counter() - t)
+    log.info("Cache sweep removed %d stale files", sweep_cache())
+    threading.Thread(target=sweep_loop, daemon=True).start()
     log.info("Open http://%s:%d", display_host(HOST), PORT)
     Server((HOST, PORT), Handler).serve_forever()
 
