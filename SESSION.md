@@ -52,7 +52,7 @@ flowchart LR
       H["index.html: selection bar, confirm sheet"]
       C["style.css: ring, bar, sheet, press feedback"]
       A["app.js: grid, lightbox, folder picker"]
-      N["select.js: long-press, toggle, bar, batch calls, report"]
+      N["select.js: long-press, toggle, bar, batch calls, report, share"]
     end
     P["server.py: batch move/delete, rename, preview clips, keyed caching, report, ver guard"]
     K[("~/.cache/civit-rv: thumbs, previews, 30-day sweep")]
@@ -74,5 +74,7 @@ flowchart LR
 - First visit to a folder pays clip encoding (background warm helps; ~0.35 s per clip on the test file).
 - The `k` key is `mtime-size`: two different files with identical mtime and size at the same id would collide (practically only on in-place edits that keep both).
 - iCloud online-only files (`st_size > 0`, `st_blocks == 0`): `/thumb` and `/preview` start a background download (deduped, 4 at a time, still runs after the request gives up) and wait 10 s (`FETCH_WAIT`); if not there yet they answer 503 `{"error": "downloading"}` (`no-store`, `Retry-After: 10`), never touching ffmpeg or `FAILED`; the tile stays empty until a later view. Warm-up skips such files; ffmpeg timeouts are not remembered as failed.
+- Share (`select.js`, `prepareShare`): the original is prefetched as a Blob (one at a time, aborted on navigate/close) so the click can call `navigator.share` synchronously. Cost: one full download of `/media/<id>` per lightbox view for files up to `SHARE_MAX` (30 MB); for iCloud online-only files that prefetch triggers the download. Larger files show `Too large to share` plus Download. Share needs a secure context: use HTTPS via `tailscale serve --bg 8765` (manual, see README); plain `http://<LAN IP>:8765` gets Download.
+- Origin guard (`origin_allowed`): no `Origin` is accepted; otherwise its netloc must equal `Host` or `X-Forwarded-Host`, else 403 `Forbidden origin` (`Origin: null` never matches). The forwarded header only widens the allowed set.
 - ffmpeg thumbnails may ignore EXIF rotation on some builds.
 - Ideas: AI-generation metadata (A1111/ComfyUI PNG prompts) in the lightbox, favorites/tags, filesystem watcher instead of Rescan.
