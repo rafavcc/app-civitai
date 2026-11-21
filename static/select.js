@@ -144,7 +144,7 @@ $('renbtn').onclick = () => { const it = listed[cur]; if (it) openRename(it); };
 // Share / Download for the lightbox item. The original is prefetched as a Blob in the background so the click can call
 // navigator.share synchronously (Safari drops the user activation after any await). One prefetch at a time.
 const SHARE_MAX = 30 * 1024 * 1024;
-let share = null;  // { it, ctrl, file } for the current lightbox item
+let share = null;  // { it, ctrl, file, obj } for the current lightbox item; obj is the blob URL shown in the lightbox
 function shareUi(mode, text) {
   const sb = $('sharebtn'), dl = $('dlbtn');
   sb.hidden = mode !== 'share';
@@ -155,10 +155,12 @@ function shareUi(mode, text) {
 }
 function cancelShare() {
   share?.ctrl?.abort();
+  if (share?.obj) URL.revokeObjectURL(share.obj);
   share = null;
   $('sharebtn').hidden = true; $('sharebtn').disabled = true;
   $('dlbtn').hidden = true;
 }
+// Returns true when it starts a prefetch; the lightbox then shows the Blob instead of requesting /media itself.
 function prepareShare(it) {
   cancelShare();
   $('dlbtn').href = url('media', it);
@@ -174,13 +176,15 @@ function prepareShare(it) {
       const blob = await r.blob();
       if (share !== mine) return;
       const file = new File([blob], it.name, { type: r.headers.get('Content-Type') || blob.type });
-      if (!navigator.canShare({ files: [file] })) return shareUi('download');
+      if (!navigator.canShare({ files: [file] })) { shareUi('download'); return showSrc(it, url('media', it)); }
       mine.file = file;
+      showSrc(it, mine.obj = URL.createObjectURL(blob));
       shareUi('share', 'Share');
     } catch (e) {
-      if (share === mine && e.name !== 'AbortError') shareUi('download');
+      if (share === mine && e.name !== 'AbortError') { shareUi('download'); showSrc(it, url('media', it)); }
     }
   })();
+  return true;
 }
 $('sharebtn').onclick = () => {
   const file = share?.file;
