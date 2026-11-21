@@ -185,7 +185,11 @@ function prepareShare(it) {
 $('sharebtn').onclick = () => {
   const file = share?.file;
   if (!file) return;
-  navigator.share({ files: [file] }).catch(e => { if (e.name !== 'AbortError') toast("Couldn't share"); });
+  navigator.share({ files: [file] }).catch(e => {
+    if (e.name === 'AbortError') return;
+    console.warn('Share failed:', e.name, e.message, '| file:', file.name, file.type, file.size, 'bytes');
+    toast("Couldn't share");
+  });
 };
 
 // Report sheet: read-only cache, folder and page statistics
