@@ -24,7 +24,7 @@ The server listens on `0.0.0.0:8765` (constants at the top of `server.py`) and p
 - Search, kind filter, sort, random order, auto-scroll; your choices are remembered per device
 - Folder navigator: breadcrumbs, subfolder counts, tap a folder to go into it, "Open here" for the folder shown, tap `MEGA` to go back to the top. Only the folder's own files are shown (not its subfolders'). Move uses the same navigator, so any folder under the top-level folder is a valid destination
 - The last folder is remembered across restarts
-- Share (or Download) button in the lightbox; see [Share](#share)
+- Share button in the lightbox; see [Share](#share)
 - Dark theme, iOS meta tags, safe-area padding for the notch / Dynamic Island
 
 ## Multi-select
@@ -89,7 +89,7 @@ sequenceDiagram
 ```
 
 ## Share
-The lightbox has a **Share** button that opens the iOS/macOS share sheet with the original file (Save to Photos, AirDrop, Messages...). It needs a secure context (HTTPS), so it does not appear on plain `http://<LAN IP>:8765`. There the button is **Download** instead (a normal download link); that URL keeps working unchanged. The same fallback applies in Firefox, in older browsers that can't share files, and when sharing the file fails to prepare. Files over 30 MB show a disabled `Too large to share` plus Download. While the file is fetched in the background the button reads `Preparing…`. A cancelled share sheet shows nothing; a real error shows `Couldn't share`.
+The lightbox always has a **Share** button that opens the iOS/macOS share sheet with the original file (Save to Photos, AirDrop, Messages...). It needs a secure context (HTTPS). When sharing can't work, tapping it shows the reason instead: `Open the https:// address to share` (plain `http://<LAN IP>:8765`; that URL keeps working for browsing), `This browser can't share files` (e.g. Firefox, older browsers), `Too large to share (over 30 MB)`, `This browser can't share this file type`, or `Couldn't load the file to share`. There is no Download fallback. While the file is fetched in the background the button reads `Preparing…` and is disabled. A cancelled share sheet shows nothing; a real error shows `Couldn't share`.
 
 Getting HTTPS uses Tailscale Serve. These steps are manual and done once; the app is not changed and needs no certificates, it stays plain HTTP on port 8765:
 1. In the Tailscale admin console, DNS page, enable MagicDNS and HTTPS certificates.
@@ -109,4 +109,4 @@ python3 -m unittest discover -s tests
 ```
 
 ## Files
-`server.py` (server), `static/index.html`, `static/style.css`, `static/app.js`, `static/select.js` (UI; `select.js` has multi-select, the batch Move/Delete calls, the Report sheet and the lightbox Share/Download button), `tests/test_server.py`.
+`server.py` (server), `static/index.html`, `static/style.css`, `static/app.js`, `static/select.js` (UI; `select.js` has multi-select, the batch Move/Delete calls, the Report sheet and the lightbox Share button), `tests/test_server.py`.
