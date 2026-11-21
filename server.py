@@ -411,8 +411,8 @@ class HttpError(Exception):
 
 
 def origin_allowed(headers):
-    """CSRF origin check: no Origin is fine; otherwise its host must be the Host or X-Forwarded-Host (set by a
-    TLS-terminating proxy such as `tailscale serve`). An empty netloc (Origin: null) never matches."""
+    """CSRF origin check: no Origin is fine; otherwise its host must be the Host (if a proxy keeps it) or
+    X-Forwarded-Host (if a TLS-terminating proxy sets it). An empty netloc (Origin: null) never matches."""
     origin = headers.get("Origin")
     if origin is None:
         return True

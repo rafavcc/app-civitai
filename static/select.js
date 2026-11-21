@@ -122,6 +122,10 @@ function openRename(it) {
     const label = it.el?.querySelector('.label');
     if (label) label.textContent = it.path;
     if (listed[cur] === it) $('lbinfo').textContent = `${it.path} · ${(it.size / 1048576).toFixed(2)} MB · ${new Date(it.mtime * 1000).toLocaleString()}`;
+    if (listed[cur] === it) {  // keep the Download link and the prefetched file in step with the new name
+      $('dlbtn').download = it.name;
+      if (share?.it === it && share.file) share.file = new File([share.file], it.name, { type: share.file.type });
+    }
     finish();
     toast('Renamed to ' + it.name, 'ok');
   };

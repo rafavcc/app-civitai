@@ -98,7 +98,7 @@ Getting HTTPS uses Tailscale Serve. These steps are manual and done once; the ap
 4. On the iPhone or Mac, with Tailscale connected, open `https://w11-wsl-ts.<tailnet>.ts.net`.
 5. To turn it off: `tailscale serve reset`.
 
-The server accepts POSTs whose `Origin` matches `Host` or `X-Forwarded-Host` (which Tailscale Serve sets), so Move, Delete and Rename work over the HTTPS address; any other origin is still refused with 403.
+The server accepts POSTs whose `Origin` matches `Host` or `X-Forwarded-Host` (whichever the proxy keeps or sets), so Move, Delete and Rename should work over the HTTPS address; any other origin is still refused with 403. If Move, Delete or Rename show "Forbidden origin" on the https address, report it: the proxy rewrote `Host` without setting `X-Forwarded-Host`.
 
 ## Remembered folder
 The folder you were in is saved in `state.json` and restored on restart, as long as it is still inside `FOLDER`.
