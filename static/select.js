@@ -137,6 +137,53 @@ function openRename(it) {
 }
 $('renbtn').onclick = () => { const it = listed[cur]; if (it) openRename(it); };
 
+// Share / Download for the lightbox item. The original is prefetched as a Blob in the background so the click can call
+// navigator.share synchronously (Safari drops the user activation after any await). One prefetch at a time.
+const SHARE_MAX = 30 * 1024 * 1024;
+let share = null;  // { it, ctrl, file } for the current lightbox item
+function shareUi(mode, text) {
+  const sb = $('sharebtn'), dl = $('dlbtn');
+  sb.hidden = mode !== 'share';
+  sb.disabled = mode === 'share' && text !== 'Share';
+  if (mode === 'share') sb.textContent = text;
+  dl.hidden = mode !== 'download' && mode !== 'large';
+  if (mode === 'large') { sb.hidden = false; sb.disabled = true; sb.textContent = 'Too large to share'; }
+}
+function cancelShare() {
+  share?.ctrl?.abort();
+  share = null;
+  $('sharebtn').hidden = true; $('sharebtn').disabled = true;
+  $('dlbtn').hidden = true;
+}
+function prepareShare(it) {
+  cancelShare();
+  $('dlbtn').href = url('media', it);
+  $('dlbtn').download = it.name;
+  if (it.size > SHARE_MAX) return shareUi('large');
+  if (!isSecureContext || typeof navigator.share !== 'function' || typeof navigator.canShare !== 'function') return shareUi('download');
+  const mine = share = { it, ctrl: new AbortController(), file: null };
+  shareUi('share', 'Preparing…');
+  (async () => {
+    try {
+      const r = await fetch(url('media', it), { signal: mine.ctrl.signal });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const blob = await r.blob();
+      if (share !== mine) return;
+      const file = new File([blob], it.name, { type: r.headers.get('Content-Type') || blob.type });
+      if (!navigator.canShare({ files: [file] })) return shareUi('download');
+      mine.file = file;
+      shareUi('share', 'Share');
+    } catch (e) {
+      if (share === mine && e.name !== 'AbortError') shareUi('download');
+    }
+  })();
+}
+$('sharebtn').onclick = () => {
+  const file = share?.file;
+  if (!file) return;
+  navigator.share({ files: [file] }).catch(e => { if (e.name !== 'AbortError') toast("Couldn't share"); });
+};
+
 // Report sheet: read-only cache, folder and page statistics
 function fmtBytes(n) {
   if (!Number.isFinite(n)) return 'n/a';

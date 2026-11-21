@@ -117,6 +117,7 @@ function openLb(i, dir = 1) {
     return n >= 0 && n < listed.length ? openLb(n, dir) : closeLb();
   }
   cur = i;
+  prepareShare(it);
   if (it.kind === 'image') {
     // Show the cached thumb at once, swap in the full image when it has loaded (if still on this item)
     $('lbmedia').innerHTML = `<img src="${url('thumb', it)}">`;
@@ -134,7 +135,7 @@ function openLb(i, dir = 1) {
   }
   if (i >= listed.length - 3) loadMore();
 }
-function closeLb() { $('lb').classList.remove('open'); $('lbmedia').innerHTML = ''; cur = -1; }
+function closeLb() { cancelShare(); $('lb').classList.remove('open'); $('lbmedia').innerHTML = ''; cur = -1; }
 $('backbtn').onclick = closeLb;
 $('lb').onclick = e => { if (e.target === $('lb')) closeLb(); };
 addEventListener('keydown', e => {

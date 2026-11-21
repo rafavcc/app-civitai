@@ -37,7 +37,9 @@
   #lb img, #lb video { max-width: 96vw; max-height: 80vh; }
   #lbbar { margin-bottom: 10px; display: flex; gap: 10px; align-items: center; }
   #lbinfo { margin-top: 8px; font-size: 13px; max-width: 96vw; opacity: .8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #lbbar button { background: #25262b; color: inherit; border: 1px solid #373a40; border-radius: 6px; padding: 5px 12px; font-size: 13px; cursor: pointer; flex: none; }
+  #lbbar button, #lbbar a { background: #25262b; color: inherit; border: 1px solid #373a40; border-radius: 6px; padding: 5px 12px; font-size: 13px; cursor: pointer; flex: none; text-decoration: none; }
+  #lbbar [hidden] { display: none; }
+  #lbbar button:disabled { opacity: .5; cursor: default; }
   #mv { position: fixed; inset: 0; background: rgba(0,0,0,.94); display: none; z-index: 30; flex-direction: column; padding: calc(16px + var(--sat)) calc(16px + var(--sar)) calc(16px + var(--sab)) calc(16px + var(--sal)); overflow-y: auto; }
   #mv.open { display: flex; }
   #toast { position: fixed; bottom: calc(24px + var(--sab)); left: 50%; transform: translateX(-50%); background: #c92a2a; color: #fff; padding: 8px 14px; border-radius: 8px; font-size: 14px; z-index: 40; display: none; }
