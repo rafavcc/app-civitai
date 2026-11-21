@@ -1083,6 +1083,42 @@ class Hardening(GalleryTestCase):
         self.assertEqual(status, 200)
         self.assertFalse((self.root / "a.png").exists())
 
+    def _origin_post(self, headers):
+        body = json.dumps({"ids": [self.id_of("a.png")], "ver": self.ver()}).encode()
+        return self.raw_post("/api/delete", body, headers)
+
+    def test_origin_matching_host_is_allowed(self):
+        status, _ = self._origin_post({"Content-Type": "application/json", "Origin": self.base})
+        self.assertEqual(status, 200)
+        self.assertFalse((self.root / "a.png").exists())
+
+    def test_origin_matching_x_forwarded_host_is_allowed(self):
+        status, _ = self._origin_post({"Content-Type": "application/json",
+                                       "Origin": "https://w11-wsl-ts.tail1234.ts.net",
+                                       "X-Forwarded-Host": "w11-wsl-ts.tail1234.ts.net"})
+        self.assertEqual(status, 200)
+        self.assertFalse((self.root / "a.png").exists())
+
+    def test_origin_mismatching_both_headers_is_403(self):
+        for extra in ({"X-Forwarded-Host": "w11-wsl-ts.tail1234.ts.net"}, {}):
+            status, _ = self._origin_post({"Content-Type": "application/json",
+                                           "Origin": "https://evil.example", **extra})
+            self.assertEqual(status, 403, extra)
+            self.assertTrue((self.root / "a.png").exists())
+
+    def test_origin_null_or_empty_netloc_is_403(self):
+        status, _ = self._origin_post({"Content-Type": "application/json", "Origin": "null",
+                                       "X-Forwarded-Host": ""})
+        self.assertEqual(status, 403)
+        self.assertTrue((self.root / "a.png").exists())
+
+    def test_x_forwarded_host_still_needs_json(self):
+        status, _ = self._origin_post({"Content-Type": "text/plain",
+                                       "Origin": "https://w11-wsl-ts.tail1234.ts.net",
+                                       "X-Forwarded-Host": "w11-wsl-ts.tail1234.ts.net"})
+        self.assertEqual(status, 415)
+        self.assertTrue((self.root / "a.png").exists())
+
     def test_symlink_is_refused_and_target_survives(self):
         os.symlink(self.root / "a.png", self.root / "link.png")
         server.scan()
