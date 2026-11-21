@@ -109,6 +109,15 @@ fetch('/api/info').then(r => r.json()).then(r => { baseName = r.base; setLocatio
 $('rescan').onclick = async () => { await fetch('/api/rescan'); reset(); };
 
 let cur = -1;
+// Points the lightbox element of item `it` (if still current) at src: the /media URL or a blob URL of the prefetched file
+function showSrc(it, src) {
+  const el = $('lbmedia').firstChild;
+  if (listed[cur] !== it || !el) return;
+  if (it.kind !== 'image') { el.src = src; return; }
+  const full = new Image();
+  full.onload = () => { if (listed[cur] === it && $('lbmedia').firstChild === el) el.src = src; };
+  full.src = src;
+}
 function openLb(i, dir = 1) {
   const it = listed[i];
   if (!it) return;
@@ -117,14 +126,13 @@ function openLb(i, dir = 1) {
     return n >= 0 && n < listed.length ? openLb(n, dir) : closeLb();
   }
   cur = i;
+  const pre = prepareShare(it);  // true: the share prefetch supplies the file (blob URL), so /media is not requested here
   if (it.kind === 'image') {
     // Show the cached thumb at once, swap in the full image when it has loaded (if still on this item)
     $('lbmedia').innerHTML = `<img src="${url('thumb', it)}">`;
-    const im = $('lbmedia').firstChild, full = new Image(), big = url('media', it);
-    full.onload = () => { if (cur === i && $('lbmedia').firstChild === im) im.src = big; };
-    full.src = big;
+    if (!pre) showSrc(it, url('media', it));
   } else {
-    $('lbmedia').innerHTML = `<video src="${url('media', it)}" controls autoplay loop muted playsinline></video>`;
+    $('lbmedia').innerHTML = `<video ${pre ? `poster="${url('thumb', it)}"` : `src="${url('media', it)}"`} controls autoplay loop muted playsinline></video>`;
     $('lbmedia').firstChild.muted = true;
   }
   $('lbinfo').textContent = `${it.path} · ${(it.size / 1048576).toFixed(2)} MB · ${new Date(it.mtime * 1000).toLocaleString()}`;
@@ -134,7 +142,7 @@ function openLb(i, dir = 1) {
   }
   if (i >= listed.length - 3) loadMore();
 }
-function closeLb() { $('lb').classList.remove('open'); $('lbmedia').innerHTML = ''; cur = -1; }
+function closeLb() { cancelShare(); $('lb').classList.remove('open'); $('lbmedia').innerHTML = ''; cur = -1; }
 $('backbtn').onclick = closeLb;
 $('lb').onclick = e => { if (e.target === $('lb')) closeLb(); };
 addEventListener('keydown', e => {

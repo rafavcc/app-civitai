@@ -122,6 +122,10 @@ function openRename(it) {
     const label = it.el?.querySelector('.label');
     if (label) label.textContent = it.path;
     if (listed[cur] === it) $('lbinfo').textContent = `${it.path} · ${(it.size / 1048576).toFixed(2)} MB · ${new Date(it.mtime * 1000).toLocaleString()}`;
+    if (listed[cur] === it) {  // keep the Download link and the prefetched file in step with the new name
+      $('dlbtn').download = it.name;
+      if (share?.it === it && share.file) share.file = new File([share.file], it.name, { type: share.file.type });
+    }
     finish();
     toast('Renamed to ' + it.name, 'ok');
   };
@@ -136,6 +140,61 @@ function openRename(it) {
   input.select();
 }
 $('renbtn').onclick = () => { const it = listed[cur]; if (it) openRename(it); };
+
+// Share / Download for the lightbox item. The original is prefetched as a Blob in the background so the click can call
+// navigator.share synchronously (Safari drops the user activation after any await). One prefetch at a time.
+const SHARE_MAX = 30 * 1024 * 1024;
+let share = null;  // { it, ctrl, file, obj } for the current lightbox item; obj is the blob URL shown in the lightbox
+function shareUi(mode, text) {
+  const sb = $('sharebtn'), dl = $('dlbtn');
+  sb.hidden = mode !== 'share';
+  sb.disabled = mode === 'share' && text !== 'Share';
+  if (mode === 'share') sb.textContent = text;
+  dl.hidden = mode !== 'download' && mode !== 'large';
+  if (mode === 'large') { sb.hidden = false; sb.disabled = true; sb.textContent = 'Too large to share'; }
+}
+function cancelShare() {
+  share?.ctrl?.abort();
+  if (share?.obj) URL.revokeObjectURL(share.obj);
+  share = null;
+  $('sharebtn').hidden = true; $('sharebtn').disabled = true;
+  $('dlbtn').hidden = true;
+}
+// Returns true when it starts a prefetch; the lightbox then shows the Blob instead of requesting /media itself.
+function prepareShare(it) {
+  cancelShare();
+  $('dlbtn').href = url('media', it);
+  $('dlbtn').download = it.name;
+  if (it.size > SHARE_MAX) return shareUi('large');
+  if (!isSecureContext || typeof navigator.share !== 'function' || typeof navigator.canShare !== 'function') return shareUi('download');
+  const mine = share = { it, ctrl: new AbortController(), file: null };
+  shareUi('share', 'Preparing…');
+  (async () => {
+    try {
+      const r = await fetch(url('media', it), { signal: mine.ctrl.signal });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const blob = await r.blob();
+      if (share !== mine) return;
+      const file = new File([blob], it.name, { type: r.headers.get('Content-Type') || blob.type });
+      if (!navigator.canShare({ files: [file] })) { shareUi('download'); return showSrc(it, url('media', it)); }
+      mine.file = file;
+      showSrc(it, mine.obj = URL.createObjectURL(blob));
+      shareUi('share', 'Share');
+    } catch (e) {
+      if (share === mine && e.name !== 'AbortError') { shareUi('download'); showSrc(it, url('media', it)); }
+    }
+  })();
+  return true;
+}
+$('sharebtn').onclick = () => {
+  const file = share?.file;
+  if (!file) return;
+  navigator.share({ files: [file] }).catch(e => {
+    if (e.name === 'AbortError') return;
+    console.warn('Share failed:', e.name, e.message, '| file:', file.name, file.type, file.size, 'bytes');
+    toast("Couldn't share");
+  });
+};
 
 // Report sheet: read-only cache, folder and page statistics
 function fmtBytes(n) {

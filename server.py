@@ -410,6 +410,16 @@ class HttpError(Exception):
         self.status, self.message = status, message
 
 
+def origin_allowed(headers):
+    """CSRF origin check: no Origin is fine; otherwise its host must be the Host (if a proxy keeps it) or
+    X-Forwarded-Host (if a TLS-terminating proxy sets it). An empty netloc (Origin: null) never matches."""
+    origin = headers.get("Origin")
+    if origin is None:
+        return True
+    netloc = urlparse(origin).netloc
+    return bool(netloc) and netloc in (headers.get("Host", ""), headers.get("X-Forwarded-Host", ""))
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -536,8 +546,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(n)
         # CSRF guard: a cross-site form/fetch can only send "simple" requests (text/plain etc.) with no
         # preflight, so demanding JSON forces a preflight this server never approves; also refuse foreign origins
-        origin = self.headers.get("Origin")
-        if origin is not None and urlparse(origin).netloc != self.headers.get("Host", ""):
+        if not origin_allowed(self.headers):
             raise HttpError(403, "Forbidden origin")
         if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
             raise HttpError(415, "Unsupported media type")
