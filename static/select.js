@@ -155,7 +155,7 @@ function cancelShare() {
   share = null;
   $('sharebtn').hidden = true; $('sharebtn').disabled = true;
 }
-// Marks the current item as unshareable; returns true so callers can `return unshareable(...)`.
+// Marks the current item as unshareable: the button stays enabled and tapping it toasts `reason`.
 function unshareable(it, reason) {
   share = { it, ctrl: null, file: null, obj: null, reason };
   shareUi('Share', true);
