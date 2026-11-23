@@ -18,7 +18,7 @@ Show local images/videos as tiles like civitai.com, loading more on scroll. Main
 - `tests/test_server.py`: stdlib unittest (`python3 -m unittest discover -s tests`).
 
 ## Run
-`python3 server.py /path/to/MEGA` (the folder is the top-level/root; the systemd user unit `~/.config/systemd/user/app-civitai.service` runs it from `/home/rafavcc/app-civitai`; manage it with `systemctl --user restart|status app-civitai`, logs via `journalctl --user -u app-civitai`). Host/port are constants in `server.py`.
+`python3 server.py /path/to/MEGA` (the folder is the top-level/root; the systemd user unit `~/.config/systemd/user/app-civitai.service` runs it from `/home/rafavcc/dev/app-civitai`; manage it with `systemctl --user restart|status app-civitai`, logs via `journalctl --user -u app-civitai`). Host/port are constants in `server.py`.
 
 ## Branches
 `main` is the branch running on WSL. Multi-select is merged. The speed/UX features (hover previews, cache keys, 4/5/6 columns, rename, cache report) are described in the sections above and README.
